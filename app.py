@@ -23,6 +23,20 @@ BASE_W = 1280
 BASE_H = 555
 MASK_SCALE = 4
 
+PALETTE = {
+    "original": ("Original beige", "#bba286"),
+    "green": ("Green", "#4b9b63"),
+    "light-green": ("Light green", "#bfe39b"),
+    "mint": ("Mint", "#9bdcc5"),
+    "pink": ("Pink", "#df6d9c"),
+    "light-pink": ("Light pink", "#f7bfd6"),
+    "rose": ("Rose", "#d84f72"),
+    "sky": ("Sky blue", "#74bbe9"),
+    "purple": ("Lavender", "#b998eb"),
+    "navy": ("Deep blue", "#163a72"),
+    "red": ("Original red", "#8d1c22"),
+}
+
 PRESETS = {
     "original": {
         "name": "Original",
@@ -493,6 +507,7 @@ class ColorRenderer:
 
 
 def html_page() -> bytes:
+    palette_json = json.dumps(PALETTE)
     presets_json = json.dumps(PRESETS)
     return f"""<!doctype html>
 <html lang="en">
@@ -624,13 +639,18 @@ def html_page() -> bytes:
       border: 1px solid rgb(0 0 0 / 18%);
       box-shadow: inset 0 0 0 1px rgb(255 255 255 / 25%);
     }}
-    input[type="color"] {{
+    select, input[type="color"] {{
       height: 34px;
       border: 1px solid rgb(25 24 21 / 18%);
       border-radius: 8px;
       background: white;
       color: #191815;
       font: inherit;
+    }}
+    select {{
+      flex: 1;
+      min-width: 150px;
+      padding: 0 9px;
     }}
     input[type="color"] {{
       width: 46px;
@@ -772,6 +792,7 @@ def html_page() -> bytes:
           <p class="eyebrow">Controls</p>
           <h2>Color combinations</h2>
         </div>
+        <button class="secondary" type="button" id="shuffle">Shuffle</button>
       </div>
 
       <div id="areas"></div>
@@ -793,6 +814,7 @@ def html_page() -> bytes:
     </aside>
   </main>
   <script>
+    const palette = {palette_json};
     const presets = {presets_json};
     const state = {{
       a: '#bba286',
@@ -825,6 +847,14 @@ def html_page() -> bytes:
       return /^[0-9a-f]{{6}}$/i.test(digits) ? `#${{digits.toLowerCase()}}` : null;
     }}
 
+    function colorOptions(selected) {{
+      const known = Object.values(palette).some(([, hex]) => hex.toLowerCase() === selected.toLowerCase());
+      const custom = known ? '' : `<option value="${{selected}}" selected>Custom color</option>`;
+      return custom + Object.values(palette).map(([name, hex]) =>
+        `<option value="${{hex}}" ${{hex.toLowerCase() === selected.toLowerCase() ? 'selected' : ''}}>${{name}}</option>`
+      ).join('');
+    }}
+
     function renderControls() {{
       areaRoot.innerHTML = ['a', 'b', 'c'].map((key) => `
         <section class="area">
@@ -833,6 +863,7 @@ def html_page() -> bytes:
               <span class="swatch" id="${{key}}-swatch" style="background:${{state[key]}}"></span>
               <span>${{labels[key]}}</span>
             </div>
+            <select id="${{key}}-select" aria-label="Color for ${{key.toUpperCase()}} area">${{colorOptions(state[key])}}</select>
             <input id="${{key}}-custom" type="color" value="${{state[key]}}" aria-label="Custom color for ${{key.toUpperCase()}} area" />
           </div>
           <input id="${{key}}-code" class="color-code" type="text" value="${{state[key].toUpperCase()}}" spellcheck="false" maxlength="7" aria-label="Color code for ${{key.toUpperCase()}} area" />
@@ -847,6 +878,13 @@ def html_page() -> bytes:
       `).join('');
 
       for (const key of ['a', 'b', 'c']) {{
+        document.getElementById(`${{key}}-select`).addEventListener('change', (event) => {{
+          state[key] = event.target.value;
+          activateColor(key);
+          document.getElementById(`${{key}}-custom`).value = state[key];
+          document.getElementById(`${{key}}-code`).value = state[key].toUpperCase();
+          update();
+        }});
         document.getElementById(`${{key}}-custom`).addEventListener('input', (event) => {{
           state[key] = event.target.value;
           activateColor(key);
@@ -902,6 +940,17 @@ def html_page() -> bytes:
 
     document.getElementById('masks').addEventListener('change', (event) => {{
       state.masks = event.target.checked ? 1 : 0;
+      update();
+    }});
+    document.getElementById('shuffle').addEventListener('click', () => {{
+      const colors = Object.values(palette).map(([, hex]) => hex);
+      state.a = colors[Math.floor(Math.random() * colors.length)];
+      state.b = colors[Math.floor(Math.random() * colors.length)];
+      state.c = colors[Math.floor(Math.random() * colors.length)];
+      state.oa = 45;
+      state.ob = 45;
+      state.oc = 52;
+      renderControls();
       update();
     }});
     document.getElementById('reset').addEventListener('click', () => {{
