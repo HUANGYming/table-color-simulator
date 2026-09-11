@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/
+
+# Generated previews and mask diagnostics
+*-debug.png
+*-preview.png
+ab-text-mask-*.png
+sample-output.png
+soft-preset-preview.png
+white-line-contrast-preview.png
+
+# Superseded source and helper files
+original.jpg
+ppt-mask-template.jpg

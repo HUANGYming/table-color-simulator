@@ -1,0 +1,13 @@
+[project]
+name = "table-color-simulator"
+version = "0.1.0"
+description = "A local Pillow web app for simulating table-area color combinations."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "pillow>=10.0",
+]
+
+[tool.uv]
+package = false
