@@ -738,6 +738,73 @@ def html_page() -> bytes:
       gap: 8px;
       margin-top: 8px;
     }}
+    .save-actions {{
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-top: 14px;
+    }}
+    .saved-list {{
+      display: grid;
+      gap: 7px;
+      margin-top: 8px;
+    }}
+    .saved-empty {{
+      margin-top: 8px;
+      border-top: 1px solid rgb(25 24 21 / 10%);
+      border-bottom: 1px solid rgb(25 24 21 / 10%);
+      color: #777168;
+      padding: 10px 2px;
+      font-size: 12px;
+    }}
+    .saved-item {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 7px;
+      align-items: stretch;
+    }}
+    .saved-apply {{
+      min-width: 0;
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 9px;
+      align-items: center;
+      border-color: rgb(25 24 21 / 12%);
+      background: #fbfaf6;
+      color: #191815;
+      padding: 8px 9px;
+      text-align: left;
+    }}
+    .saved-swatches {{
+      display: grid;
+      grid-template-columns: repeat(3, 14px);
+      gap: 3px;
+    }}
+    .saved-swatch {{
+      width: 14px;
+      height: 28px;
+      border: 1px solid rgb(0 0 0 / 14%);
+      border-radius: 3px;
+    }}
+    .saved-copy {{
+      min-width: 0;
+      display: grid;
+      gap: 2px;
+    }}
+    .saved-name {{ font-size: 12px; font-weight: 800; }}
+    .saved-values {{
+      overflow: hidden;
+      color: #6b665d;
+      font: 10px ui-monospace, SFMono-Regular, Menlo, monospace;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }}
+    .saved-delete {{
+      width: 58px;
+      min-height: 46px;
+      background: white;
+      color: #8d3941;
+    }}
     .check {{
       display: flex;
       align-items: center;
@@ -805,6 +872,14 @@ def html_page() -> bytes:
       <p class="eyebrow" style="margin-top: 16px;">Presets</p>
       <div class="preset-grid" id="presets"></div>
 
+      <div class="save-actions">
+        <button type="button" id="save-combination">Save Combination</button>
+        <button class="secondary" type="button" id="compare-original">Hold to Compare Original</button>
+      </div>
+
+      <p class="eyebrow" style="margin-top: 16px;">Saved combinations</p>
+      <div class="saved-list" id="saved-combinations"></div>
+
       <div class="buttons">
         <button class="secondary" type="button" id="reset">Reset</button>
         <a class="button" id="download" href="/download.png" download="table-color-simulation.png">Download PNG</a>
@@ -830,6 +905,9 @@ def html_page() -> bytes:
     const hexRoot = document.getElementById('hexes');
     const img = document.getElementById('render');
     const download = document.getElementById('download');
+    const savedRoot = document.getElementById('saved-combinations');
+    const storageKey = 'table-color-simulator-combinations-v1';
+    let savedCombinations = loadSavedCombinations();
 
     function activateColor(key) {{
       if (state['o' + key] > 0) return;
@@ -845,6 +923,66 @@ def html_page() -> bytes:
     function normalizeColorCode(value) {{
       const digits = value.trim().replace(/^#/, '');
       return /^[0-9a-f]{{6}}$/i.test(digits) ? `#${{digits.toLowerCase()}}` : null;
+    }}
+
+    function loadSavedCombinations() {{
+      try {{
+        const parsed = JSON.parse(localStorage.getItem(storageKey) || '[]');
+        if (!Array.isArray(parsed)) return [];
+        return parsed.filter((item) =>
+          item && ['a', 'b', 'c'].every((key) => normalizeColorCode(item[key])) &&
+          ['oa', 'ob', 'oc'].every((key) => Number.isFinite(Number(item[key])))
+        ).slice(0, 12);
+      }} catch (_) {{
+        return [];
+      }}
+    }}
+
+    function persistSavedCombinations() {{
+      try {{
+        localStorage.setItem(storageKey, JSON.stringify(savedCombinations));
+      }} catch (_) {{
+        // The in-memory list still works when browser storage is unavailable.
+      }}
+    }}
+
+    function currentCombination() {{
+      return {{
+        id: Date.now(),
+        a: state.a,
+        b: state.b,
+        c: state.c,
+        oa: state.oa,
+        ob: state.ob,
+        oc: state.oc,
+      }};
+    }}
+
+    function combinationSignature(item) {{
+      return ['a', 'b', 'c', 'oa', 'ob', 'oc'].map((key) => item[key]).join('|');
+    }}
+
+    function renderSavedCombinations() {{
+      if (!savedCombinations.length) {{
+        savedRoot.innerHTML = '<div class="saved-empty">No saved combinations yet.</div>';
+        return;
+      }}
+      savedRoot.innerHTML = savedCombinations.map((item, index) => `
+        <div class="saved-item">
+          <button class="saved-apply" type="button" data-saved-action="apply" data-saved-id="${{item.id}}">
+            <span class="saved-swatches" aria-hidden="true">
+              <span class="saved-swatch" style="background:${{item.a}}"></span>
+              <span class="saved-swatch" style="background:${{item.b}}"></span>
+              <span class="saved-swatch" style="background:${{item.c}}"></span>
+            </span>
+            <span class="saved-copy">
+              <span class="saved-name">Combination ${{index + 1}}</span>
+              <span class="saved-values">A ${{item.a.toUpperCase()}} ${{item.oa}}% · B ${{item.b.toUpperCase()}} ${{item.ob}}% · C ${{item.c.toUpperCase()}} ${{item.oc}}%</span>
+            </span>
+          </button>
+          <button class="saved-delete" type="button" data-saved-action="delete" data-saved-id="${{item.id}}">Delete</button>
+        </div>
+      `).join('');
     }}
 
     function colorOptions(selected) {{
@@ -953,6 +1091,70 @@ def html_page() -> bytes:
       renderControls();
       update();
     }});
+    document.getElementById('save-combination').addEventListener('click', (event) => {{
+      const combination = currentCombination();
+      const signature = combinationSignature(combination);
+      savedCombinations = [
+        combination,
+        ...savedCombinations.filter((item) => combinationSignature(item) !== signature),
+      ].slice(0, 12);
+      persistSavedCombinations();
+      renderSavedCombinations();
+      const button = event.currentTarget;
+      button.textContent = 'Saved';
+      setTimeout(() => {{ button.textContent = 'Save Combination'; }}, 900);
+    }});
+    savedRoot.addEventListener('click', (event) => {{
+      const button = event.target.closest('[data-saved-action]');
+      if (!button) return;
+      const id = button.dataset.savedId;
+      const item = savedCombinations.find((saved) => String(saved.id) === id);
+      if (!item) return;
+      if (button.dataset.savedAction === 'delete') {{
+        savedCombinations = savedCombinations.filter((saved) => String(saved.id) !== id);
+        persistSavedCombinations();
+        renderSavedCombinations();
+        return;
+      }}
+      Object.assign(state, {{
+        a: item.a,
+        b: item.b,
+        c: item.c,
+        oa: Math.max(0, Math.min(70, Number(item.oa))),
+        ob: Math.max(0, Math.min(70, Number(item.ob))),
+        oc: Math.max(0, Math.min(70, Number(item.oc))),
+        masks: 0,
+      }});
+      document.getElementById('masks').checked = false;
+      renderControls();
+      update();
+    }});
+
+    const compareButton = document.getElementById('compare-original');
+    let comparingOriginal = false;
+    function showOriginal() {{
+      if (comparingOriginal) return;
+      comparingOriginal = true;
+      img.src = `/original.jpg?_=${{Date.now()}}`;
+    }}
+    function restoreCurrent() {{
+      if (!comparingOriginal) return;
+      comparingOriginal = false;
+      update();
+    }}
+    compareButton.addEventListener('pointerdown', (event) => {{
+      event.preventDefault();
+      showOriginal();
+    }});
+    compareButton.addEventListener('pointerup', restoreCurrent);
+    compareButton.addEventListener('pointerleave', restoreCurrent);
+    compareButton.addEventListener('pointercancel', restoreCurrent);
+    compareButton.addEventListener('keydown', (event) => {{
+      if (event.key === ' ' || event.key === 'Enter') showOriginal();
+    }});
+    compareButton.addEventListener('keyup', (event) => {{
+      if (event.key === ' ' || event.key === 'Enter') restoreCurrent();
+    }});
     document.getElementById('reset').addEventListener('click', () => {{
       Object.assign(state, {{ a: '#bba286', b: '#bba286', c: '#bba286', oa: 0, ob: 0, oc: 0, masks: 0 }});
       document.getElementById('masks').checked = false;
@@ -973,6 +1175,7 @@ def html_page() -> bytes:
     }});
 
     renderControls();
+    renderSavedCombinations();
     update();
   </script>
 </body>
