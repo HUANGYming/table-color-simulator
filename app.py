@@ -24,7 +24,7 @@ BASE_H = 555
 MASK_SCALE = 4
 
 PALETTE = {
-    "original": ("Original beige", "#bba286"),
+    "original": ("Original area color", "#a98f78"),
     "green": ("Green", "#4b9b63"),
     "light-green": ("Light green", "#bfe39b"),
     "mint": ("Mint", "#9bdcc5"),
@@ -37,12 +37,18 @@ PALETTE = {
     "red": ("Original red", "#8d1c22"),
 }
 
+ORIGINAL_AREA_COLORS = {
+    "a": "#a98f78",
+    "b": "#bb9d83",
+    "c": "#192551",
+}
+
 PRESETS = {
     "original": {
         "name": "Original",
-        "a": "#bba286",
-        "b": "#bba286",
-        "c": "#bba286",
+        "a": ORIGINAL_AREA_COLORS["a"],
+        "b": ORIGINAL_AREA_COLORS["b"],
+        "c": ORIGINAL_AREA_COLORS["c"],
         "oa": 0,
         "ob": 0,
         "oc": 0,
@@ -509,6 +515,7 @@ class ColorRenderer:
 def html_page() -> bytes:
     palette_json = json.dumps(PALETTE)
     presets_json = json.dumps(PRESETS)
+    original_area_colors_json = json.dumps(ORIGINAL_AREA_COLORS)
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -879,7 +886,6 @@ def html_page() -> bytes:
       </div>
 
       <div class="buttons">
-        <button class="secondary" type="button" id="reset">Reset</button>
         <a class="button" id="download" href="/download.png" download="table-color-simulation.png">Download PNG</a>
       </div>
 
@@ -889,10 +895,11 @@ def html_page() -> bytes:
   <script>
     const palette = {palette_json};
     const presets = {presets_json};
+    const originalAreaColors = {original_area_colors_json};
     const state = {{
-      a: '#bba286',
-      b: '#bba286',
-      c: '#bba286',
+      a: originalAreaColors.a,
+      b: originalAreaColors.b,
+      c: originalAreaColors.c,
       oa: 0,
       ob: 0,
       oc: 0,
@@ -907,15 +914,25 @@ def html_page() -> bytes:
     const storageKey = 'table-color-simulator-combinations-v1';
     let savedCombinations = loadSavedCombinations();
 
-    function activateColor(key) {{
-      if (state['o' + key] > 0) return;
-      state['o' + key] = key === 'c' ? 52 : 45;
+    function syncOpacityControls(key) {{
       const range = document.getElementById(`${{key}}-opacity`);
       const number = document.getElementById(`${{key}}-opacity-number`);
       const label = document.getElementById(`${{key}}-opacity-text`);
       if (range) range.value = state['o' + key];
       if (number) number.value = state['o' + key];
       if (label) label.textContent = `${{state['o' + key]}}%`;
+    }}
+
+    function activateColor(key) {{
+      if (state['o' + key] > 0) return;
+      state['o' + key] = key === 'c' ? 52 : 45;
+      syncOpacityControls(key);
+    }}
+
+    function restoreOriginalAreaColor(key) {{
+      state[key] = originalAreaColors[key];
+      state['o' + key] = 0;
+      syncOpacityControls(key);
     }}
 
     function normalizeColorCode(value) {{
@@ -983,11 +1000,16 @@ def html_page() -> bytes:
       `).join('');
     }}
 
-    function colorOptions(selected) {{
-      const known = Object.values(palette).some(([, hex]) => hex.toLowerCase() === selected.toLowerCase());
+    function colorOptions(areaKey, selected) {{
+      const known = Object.entries(palette).some(([paletteKey, [, hex]]) => {{
+        const optionHex = paletteKey === 'original' ? originalAreaColors[areaKey] : hex;
+        return optionHex.toLowerCase() === selected.toLowerCase();
+      }});
       const custom = known ? '' : `<option value="${{selected}}" selected>Custom color</option>`;
-      return custom + Object.values(palette).map(([name, hex]) =>
-        `<option value="${{hex}}" ${{hex.toLowerCase() === selected.toLowerCase() ? 'selected' : ''}}>${{name}}</option>`
+      return custom + Object.entries(palette).map(([paletteKey, [name, hex]]) => {{
+        const optionHex = paletteKey === 'original' ? originalAreaColors[areaKey] : hex;
+        return `<option value="${{optionHex}}" data-palette-key="${{paletteKey}}" ${{optionHex.toLowerCase() === selected.toLowerCase() ? 'selected' : ''}}>${{name}}</option>`;
+      }}
       ).join('');
     }}
 
@@ -999,7 +1021,7 @@ def html_page() -> bytes:
               <span class="swatch" id="${{key}}-swatch" style="background:${{state[key]}}"></span>
               <span>${{labels[key]}}</span>
             </div>
-            <select id="${{key}}-select" aria-label="Color for ${{key.toUpperCase()}} area">${{colorOptions(state[key])}}</select>
+            <select id="${{key}}-select" aria-label="Color for ${{key.toUpperCase()}} area">${{colorOptions(key, state[key])}}</select>
             <input id="${{key}}-custom" type="color" value="${{state[key]}}" aria-label="Custom color for ${{key.toUpperCase()}} area" />
           </div>
           <input id="${{key}}-code" class="color-code" type="text" value="${{state[key].toUpperCase()}}" spellcheck="false" maxlength="7" aria-label="Color code for ${{key.toUpperCase()}} area" />
@@ -1015,15 +1037,24 @@ def html_page() -> bytes:
 
       for (const key of ['a', 'b', 'c']) {{
         document.getElementById(`${{key}}-select`).addEventListener('change', (event) => {{
-          state[key] = event.target.value;
-          activateColor(key);
+          const paletteKey = event.target.selectedOptions[0]?.dataset.paletteKey;
+          if (paletteKey === 'original') {{
+            restoreOriginalAreaColor(key);
+          }} else {{
+            state[key] = event.target.value;
+            activateColor(key);
+          }}
           document.getElementById(`${{key}}-custom`).value = state[key];
           document.getElementById(`${{key}}-code`).value = state[key].toUpperCase();
           update();
         }});
         document.getElementById(`${{key}}-custom`).addEventListener('input', (event) => {{
           state[key] = event.target.value;
-          activateColor(key);
+          if (state[key].toLowerCase() === originalAreaColors[key].toLowerCase()) {{
+            restoreOriginalAreaColor(key);
+          }} else {{
+            activateColor(key);
+          }}
           document.getElementById(`${{key}}-code`).value = state[key].toUpperCase();
           update();
         }});
@@ -1032,16 +1063,18 @@ def html_page() -> bytes:
           event.target.classList.toggle('invalid', !code && event.target.value.length > 0);
           if (!code) return;
           state[key] = code;
-          activateColor(key);
+          if (state[key].toLowerCase() === originalAreaColors[key].toLowerCase()) {{
+            restoreOriginalAreaColor(key);
+          }} else {{
+            activateColor(key);
+          }}
           event.target.value = state[key].toUpperCase();
           document.getElementById(`${{key}}-custom`).value = state[key];
           update();
         }});
         const setOpacity = (value) => {{
           state['o' + key] = Math.max(0, Math.min(100, Number(value) || 0));
-          document.getElementById(`${{key}}-opacity`).value = state['o' + key];
-          document.getElementById(`${{key}}-opacity-number`).value = state['o' + key];
-          document.getElementById(`${{key}}-opacity-text`).textContent = `${{state['o' + key]}}%`;
+          syncOpacityControls(key);
           update();
         }};
         document.getElementById(`${{key}}-opacity`).addEventListener('input', (event) => {{
@@ -1079,7 +1112,9 @@ def html_page() -> bytes:
       update();
     }});
     document.getElementById('shuffle').addEventListener('click', () => {{
-      const colors = Object.values(palette).map(([, hex]) => hex);
+      const colors = Object.entries(palette)
+        .filter(([paletteKey]) => paletteKey !== 'original')
+        .map(([, [, hex]]) => hex);
       state.a = colors[Math.floor(Math.random() * colors.length)];
       state.b = colors[Math.floor(Math.random() * colors.length)];
       state.c = colors[Math.floor(Math.random() * colors.length)];
@@ -1153,13 +1188,6 @@ def html_page() -> bytes:
     compareButton.addEventListener('keyup', (event) => {{
       if (event.key === ' ' || event.key === 'Enter') restoreCurrent();
     }});
-    document.getElementById('reset').addEventListener('click', () => {{
-      Object.assign(state, {{ a: '#bba286', b: '#bba286', c: '#bba286', oa: 0, ob: 0, oc: 0, masks: 0 }});
-      document.getElementById('masks').checked = false;
-      renderControls();
-      update();
-    }});
-
     const presetRoot = document.getElementById('presets');
     presetRoot.innerHTML = Object.entries(presets).map(([key, preset]) =>
       `<button class="secondary" type="button" data-preset="${{key}}">${{preset.name}}</button>`
