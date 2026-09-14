@@ -1006,8 +1006,8 @@ def html_page() -> bytes:
           <label>
             <span class="range-row"><span>Overlay strength</span><span id="${{key}}-opacity-text">${{state['o' + key]}}%</span></span>
             <span class="opacity-control">
-              <input id="${{key}}-opacity" type="range" min="0" max="70" value="${{state['o' + key]}}" aria-label="Overlay strength for ${{key.toUpperCase()}} area" />
-              <input id="${{key}}-opacity-number" class="opacity-number" type="number" min="0" max="70" value="${{state['o' + key]}}" aria-label="Overlay strength percentage for ${{key.toUpperCase()}} area" />
+              <input id="${{key}}-opacity" type="range" min="0" max="100" value="${{state['o' + key]}}" aria-label="Overlay strength for ${{key.toUpperCase()}} area" />
+              <input id="${{key}}-opacity-number" class="opacity-number" type="number" min="0" max="100" value="${{state['o' + key]}}" aria-label="Overlay strength percentage for ${{key.toUpperCase()}} area" />
             </span>
           </label>
         </section>
@@ -1038,7 +1038,7 @@ def html_page() -> bytes:
           update();
         }});
         const setOpacity = (value) => {{
-          state['o' + key] = Math.max(0, Math.min(70, Number(value) || 0));
+          state['o' + key] = Math.max(0, Math.min(100, Number(value) || 0));
           document.getElementById(`${{key}}-opacity`).value = state['o' + key];
           document.getElementById(`${{key}}-opacity-number`).value = state['o' + key];
           document.getElementById(`${{key}}-opacity-text`).textContent = `${{state['o' + key]}}%`;
@@ -1118,9 +1118,9 @@ def html_page() -> bytes:
         a: item.a,
         b: item.b,
         c: item.c,
-        oa: Math.max(0, Math.min(70, Number(item.oa))),
-        ob: Math.max(0, Math.min(70, Number(item.ob))),
-        oc: Math.max(0, Math.min(70, Number(item.oc))),
+        oa: Math.max(0, Math.min(100, Number(item.oa))),
+        ob: Math.max(0, Math.min(100, Number(item.ob))),
+        oc: Math.max(0, Math.min(100, Number(item.oc))),
         masks: 0,
       }});
       document.getElementById('masks').checked = false;
