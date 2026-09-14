@@ -1026,10 +1026,10 @@ def html_page() -> bytes:
           </div>
           <input id="${{key}}-code" class="color-code" type="text" value="${{state[key].toUpperCase()}}" spellcheck="false" maxlength="7" aria-label="Color code for ${{key.toUpperCase()}} area" />
           <label>
-            <span class="range-row"><span>Overlay strength</span><span id="${{key}}-opacity-text">${{state['o' + key]}}%</span></span>
+            <span class="range-row"><span>Opacity</span><span id="${{key}}-opacity-text">${{state['o' + key]}}%</span></span>
             <span class="opacity-control">
-              <input id="${{key}}-opacity" type="range" min="0" max="100" value="${{state['o' + key]}}" aria-label="Overlay strength for ${{key.toUpperCase()}} area" />
-              <input id="${{key}}-opacity-number" class="opacity-number" type="number" min="0" max="100" value="${{state['o' + key]}}" aria-label="Overlay strength percentage for ${{key.toUpperCase()}} area" />
+              <input id="${{key}}-opacity" type="range" min="0" max="100" value="${{state['o' + key]}}" aria-label="Opacity for ${{key.toUpperCase()}} area" />
+              <input id="${{key}}-opacity-number" class="opacity-number" type="number" min="0" max="100" value="${{state['o' + key]}}" aria-label="Opacity percentage for ${{key.toUpperCase()}} area" />
             </span>
           </label>
         </section>

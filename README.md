@@ -33,7 +33,7 @@ uv run python app.py --host 0.0.0.0 --port 8765
 ## Controls
 
 - Pick A, B, and C colors with the color picker or enter a six-digit hex code.
-- Adjust overlay strength from 0% to 100%.
+- Adjust color opacity from 0% to 100%.
 - Save up to 12 custom presets in the browser and reapply them later.
 - Hold Compare Original to temporarily view the untouched source image.
 - Use Original to return A, B, and C to their untouched source colors.
