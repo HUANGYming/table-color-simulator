@@ -871,14 +871,12 @@ def html_page() -> bytes:
 
       <p class="eyebrow" style="margin-top: 16px;">Presets</p>
       <div class="preset-grid" id="presets"></div>
+      <div class="saved-list" id="saved-combinations"></div>
 
       <div class="save-actions">
-        <button type="button" id="save-combination">Save Combination</button>
+        <button type="button" id="save-combination">Save to Presets</button>
         <button class="secondary" type="button" id="compare-original">Hold to Compare Original</button>
       </div>
-
-      <p class="eyebrow" style="margin-top: 16px;">Saved combinations</p>
-      <div class="saved-list" id="saved-combinations"></div>
 
       <div class="buttons">
         <button class="secondary" type="button" id="reset">Reset</button>
@@ -964,7 +962,7 @@ def html_page() -> bytes:
 
     function renderSavedCombinations() {{
       if (!savedCombinations.length) {{
-        savedRoot.innerHTML = '<div class="saved-empty">No saved combinations yet.</div>';
+        savedRoot.innerHTML = '<div class="saved-empty">No custom presets yet.</div>';
         return;
       }}
       savedRoot.innerHTML = savedCombinations.map((item, index) => `
@@ -976,7 +974,7 @@ def html_page() -> bytes:
               <span class="saved-swatch" style="background:${{item.c}}"></span>
             </span>
             <span class="saved-copy">
-              <span class="saved-name">Combination ${{index + 1}}</span>
+              <span class="saved-name">Preset ${{index + 1}}</span>
               <span class="saved-values">A ${{item.a.toUpperCase()}} ${{item.oa}}% · B ${{item.b.toUpperCase()}} ${{item.ob}}% · C ${{item.c.toUpperCase()}} ${{item.oc}}%</span>
             </span>
           </button>
@@ -1101,8 +1099,8 @@ def html_page() -> bytes:
       persistSavedCombinations();
       renderSavedCombinations();
       const button = event.currentTarget;
-      button.textContent = 'Saved';
-      setTimeout(() => {{ button.textContent = 'Save Combination'; }}, 900);
+      button.textContent = 'Saved to Presets';
+      setTimeout(() => {{ button.textContent = 'Save to Presets'; }}, 900);
     }});
     savedRoot.addEventListener('click', (event) => {{
       const button = event.target.closest('[data-saved-action]');
