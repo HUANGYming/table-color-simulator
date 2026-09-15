@@ -10,6 +10,7 @@ ab-text-mask-*.png
 sample-output.png
 soft-preset-preview.png
 white-line-contrast-preview.png
+saved-presets.json
 
 # Superseded source and helper files
 original.jpg

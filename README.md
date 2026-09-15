@@ -1,6 +1,6 @@
 # Table Color Simulator
 
-A local Python and Pillow web app for testing color combinations on a table layout. It supports the original segmented A/B/C layout and full-background layouts such as rose/purple source art. Printed betting artwork keeps its source colors, and the C-area line pattern is redrawn in soft white whenever C is recolored on segmented artwork.
+A local Gradio, Python, and Pillow web app for testing color combinations on a table layout. It supports the original segmented A/B/C layout and full-background layouts such as rose/purple source art. Printed betting artwork keeps its source colors, and the C-area line pattern is redrawn in soft white whenever C is recolored on segmented artwork.
 
 ## Requirements
 
@@ -24,7 +24,7 @@ uv run python app.py --host 0.0.0.0 --port 8765
 
 ## Project Files
 
-- `app.py`: web interface, mask extraction, and Pillow rendering logic.
+- `app.py`: Gradio interface, mask extraction, and Pillow rendering logic.
 - `original-hd.jpg`: high-resolution source layout.
 - `manual-table.png`: manually marked table and C-area reference.
 - `manual-b.png`: manually marked B-area reference.
@@ -32,9 +32,8 @@ uv run python app.py --host 0.0.0.0 --port 8765
 
 ## Controls
 
-- Pick area colors with the color picker or enter a six-digit hex code.
+- Pick area colors with the Gradio color picker.
 - Adjust color opacity from 0% to 100%.
-- Save up to 12 custom presets in the browser and reapply them later.
-- Hold Compare Original to temporarily view the untouched source image.
+- Save up to 12 custom presets locally and reapply them later.
 - Use Original to return editable areas to their untouched source colors.
 - Download the current result as a full-resolution PNG.

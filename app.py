@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import argparse
-import io
 import json
-import mimetypes
+import random
+import tempfile
 from collections import deque
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
 
+import gradio as gr
 import numpy as np
 from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
@@ -19,6 +17,7 @@ ORIGINAL_PATH = APP_DIR / "original-hd.jpg"
 PPT_MASK_PATH = APP_DIR / "mask.png"
 MANUAL_TABLE_PATH = APP_DIR / "manual-table.png"
 MANUAL_B_PATH = APP_DIR / "manual-b.png"
+SAVED_PRESETS_PATH = APP_DIR / "saved-presets.json"
 BASE_W = 1280
 BASE_H = 555
 MASK_SCALE = 4
@@ -46,19 +45,10 @@ ORIGINAL_AREA_COLORS = {
 
 SEGMENTED_AREA_LABELS = {"a": "A areas", "b": "B areas", "c": "C areas"}
 BACKGROUND_AREA_LABELS = {"a": "Background"}
-
-PRESETS = {
-    "original": {
-        "name": "Original",
-        "a": ORIGINAL_AREA_COLORS["a"],
-        "b": ORIGINAL_AREA_COLORS["b"],
-        "c": ORIGINAL_AREA_COLORS["c"],
-        "oa": 0,
-        "ob": 0,
-        "oc": 0,
-    },
-}
-
+GRADIO_CSS = """
+#preview img { object-fit: contain; }
+.gradio-container { max-width: none !important; }
+"""
 
 def sx(x: float, width: int) -> int:
     return round(x * width / BASE_W)
@@ -649,782 +639,6 @@ class ColorRenderer:
         return Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB")
 
 
-def html_page(renderer: ColorRenderer) -> bytes:
-    palette_json = json.dumps(PALETTE)
-    original_area_colors_json = json.dumps(renderer.original_area_colors)
-    area_labels_json = json.dumps(renderer.area_labels)
-    default_opacities_json = json.dumps(renderer.default_opacities)
-    presets = {
-        "original": {
-            "name": "Original",
-            "a": renderer.original_area_colors["a"],
-            "b": renderer.original_area_colors["b"],
-            "c": renderer.original_area_colors["c"],
-            "oa": 0,
-            "ob": 0,
-            "oc": 0,
-        },
-    }
-    presets_json = json.dumps(presets)
-    editable_status = "Background only" if renderer.mode == "background" else "A / B / C only"
-    mask_status = "Background mask" if renderer.mode == "background" else "A/B/C mask overlay"
-    image_alt = (
-        "Rendered baccarat layout with editable background color"
-        if renderer.mode == "background"
-        else "Rendered baccarat layout with editable A, B and C area colors"
-    )
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Table Color Simulator</title>
-  <style>
-    :root {{
-      color-scheme: light;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: #f4f0e8;
-      color: #191815;
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{
-      margin: 0;
-      min-height: 100vh;
-      background: linear-gradient(135deg, #f8f1e5 0%, #edf6f1 48%, #f9edf3 100%);
-    }}
-    main {{
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) 360px;
-      gap: 18px;
-      min-height: 100vh;
-      padding: 18px;
-    }}
-    .preview {{
-      min-width: 0;
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-    }}
-    header {{
-      display: flex;
-      align-items: end;
-      justify-content: space-between;
-      gap: 16px;
-      border-bottom: 1px solid rgb(25 24 21 / 12%);
-      padding-bottom: 12px;
-    }}
-    h1 {{
-      margin: 0;
-      font-size: clamp(22px, 3vw, 34px);
-      line-height: 1.05;
-      letter-spacing: 0;
-    }}
-    .eyebrow {{
-      margin: 0 0 5px;
-      color: #516f65;
-      font-size: 12px;
-      font-weight: 800;
-      text-transform: uppercase;
-    }}
-    .status {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      justify-content: flex-end;
-      font-size: 12px;
-      font-weight: 700;
-    }}
-    .pill {{
-      border: 1px solid rgb(25 24 21 / 12%);
-      border-radius: 999px;
-      background: rgb(255 255 255 / 62%);
-      padding: 7px 10px;
-      white-space: nowrap;
-    }}
-    .image-wrap {{
-      flex: 1;
-      display: grid;
-      place-items: center;
-      min-height: 420px;
-      overflow: hidden;
-      border: 1px solid rgb(0 0 0 / 14%);
-      border-radius: 8px;
-      background: #08090b;
-      box-shadow: 0 22px 60px rgb(0 0 0 / 14%);
-    }}
-    #render {{
-      display: block;
-      width: 100%;
-      height: auto;
-    }}
-    aside {{
-      border: 1px solid rgb(25 24 21 / 12%);
-      border-radius: 8px;
-      background: rgb(255 255 255 / 82%);
-      box-shadow: 0 18px 44px rgb(0 0 0 / 8%);
-      padding: 16px;
-      backdrop-filter: blur(10px);
-    }}
-    .panel-title {{
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      align-items: start;
-    }}
-    h2 {{
-      margin: 2px 0 0;
-      font-size: 18px;
-      letter-spacing: 0;
-    }}
-    .area {{
-      margin-top: 14px;
-      border: 1px solid rgb(25 24 21 / 12%);
-      border-radius: 8px;
-      background: #fbfaf6;
-      padding: 12px;
-    }}
-    .area-head {{
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 10px;
-    }}
-    .area-label {{
-      display: flex;
-      align-items: center;
-      gap: 9px;
-      min-width: 82px;
-      font-weight: 800;
-    }}
-    .swatch {{
-      width: 30px;
-      height: 30px;
-      border-radius: 6px;
-      border: 1px solid rgb(0 0 0 / 18%);
-      box-shadow: inset 0 0 0 1px rgb(255 255 255 / 25%);
-    }}
-    select, input[type="color"] {{
-      height: 34px;
-      border: 1px solid rgb(25 24 21 / 18%);
-      border-radius: 8px;
-      background: white;
-      color: #191815;
-      font: inherit;
-    }}
-    select {{
-      flex: 1;
-      min-width: 150px;
-      padding: 0 9px;
-    }}
-    input[type="color"] {{
-      width: 46px;
-      padding: 3px;
-    }}
-    .color-code {{
-      width: 100%;
-      height: 32px;
-      margin-top: 9px;
-      border: 1px solid rgb(25 24 21 / 18%);
-      border-radius: 6px;
-      background: white;
-      color: #191815;
-      font: 700 12px ui-monospace, SFMono-Regular, Menlo, monospace;
-      letter-spacing: 0;
-      padding: 0 9px;
-      text-transform: uppercase;
-    }}
-    .color-code.invalid {{
-      border-color: #bd4b55;
-      color: #a83a44;
-    }}
-    label {{
-      display: grid;
-      gap: 7px;
-      margin-top: 10px;
-      color: #5e5a51;
-      font-size: 12px;
-      font-weight: 700;
-    }}
-    .range-row {{
-      display: flex;
-      justify-content: space-between;
-      gap: 10px;
-    }}
-    input[type="range"] {{
-      width: 100%;
-      accent-color: #2f8068;
-    }}
-    .opacity-control {{
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) 58px;
-      gap: 9px;
-      align-items: center;
-    }}
-    .opacity-number {{
-      width: 58px;
-      height: 30px;
-      border: 1px solid rgb(25 24 21 / 18%);
-      border-radius: 6px;
-      background: white;
-      color: #191815;
-      font: 700 12px ui-monospace, SFMono-Regular, Menlo, monospace;
-      padding: 0 6px;
-    }}
-    .buttons {{
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 8px;
-      margin-top: 14px;
-    }}
-    button, a.button {{
-      display: inline-flex;
-      min-height: 34px;
-      align-items: center;
-      justify-content: center;
-      border: 1px solid rgb(25 24 21 / 14%);
-      border-radius: 8px;
-      background: #191815;
-      color: white;
-      padding: 8px 10px;
-      font: inherit;
-      font-size: 13px;
-      font-weight: 800;
-      text-decoration: none;
-      cursor: pointer;
-    }}
-    button.secondary, a.secondary {{
-      background: white;
-      color: #191815;
-    }}
-    .preset-grid {{
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 8px;
-      margin-top: 8px;
-    }}
-    .save-actions {{
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 8px;
-      margin-top: 14px;
-    }}
-    .saved-list {{
-      display: grid;
-      gap: 7px;
-      margin-top: 8px;
-    }}
-    .saved-empty {{
-      margin-top: 8px;
-      border-top: 1px solid rgb(25 24 21 / 10%);
-      border-bottom: 1px solid rgb(25 24 21 / 10%);
-      color: #777168;
-      padding: 10px 2px;
-      font-size: 12px;
-    }}
-    .saved-item {{
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 7px;
-      align-items: stretch;
-    }}
-    .saved-apply {{
-      min-width: 0;
-      display: grid;
-      grid-template-columns: auto minmax(0, 1fr);
-      gap: 9px;
-      align-items: center;
-      border-color: rgb(25 24 21 / 12%);
-      background: #fbfaf6;
-      color: #191815;
-      padding: 8px 9px;
-      text-align: left;
-    }}
-    .saved-swatches {{
-      display: grid;
-      grid-template-columns: repeat(var(--swatch-count, 3), 14px);
-      gap: 3px;
-    }}
-    .saved-swatch {{
-      width: 14px;
-      height: 28px;
-      border: 1px solid rgb(0 0 0 / 14%);
-      border-radius: 3px;
-    }}
-    .saved-copy {{
-      min-width: 0;
-      display: grid;
-      gap: 2px;
-    }}
-    .saved-name {{ font-size: 12px; font-weight: 800; }}
-    .saved-values {{
-      overflow: hidden;
-      color: #6b665d;
-      font: 10px ui-monospace, SFMono-Regular, Menlo, monospace;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }}
-    .saved-delete {{
-      width: 58px;
-      min-height: 46px;
-      background: white;
-      color: #8d3941;
-    }}
-    .check {{
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      margin-top: 14px;
-    }}
-    .check input {{ width: 16px; height: 16px; }}
-    .hex-list {{
-      display: grid;
-      gap: 6px;
-      margin-top: 14px;
-      border-radius: 8px;
-      background: #191b1e;
-      color: white;
-      padding: 12px;
-      font-size: 12px;
-    }}
-    .hex-line {{
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-    }}
-    @media (max-width: 980px) {{
-      main {{ grid-template-columns: 1fr; }}
-      aside {{ order: -1; }}
-      header {{ align-items: start; flex-direction: column; }}
-      .status {{ justify-content: flex-start; }}
-    }}
-  </style>
-</head>
-<body>
-  <main>
-    <section class="preview">
-      <header>
-        <div>
-          <p class="eyebrow">Local PIL color playground</p>
-          <h1>Table Color Simulator</h1>
-        </div>
-        <div class="status">
-          <span class="pill">{editable_status}</span>
-          <span class="pill">Bet type colors protected</span>
-        </div>
-      </header>
-      <div class="image-wrap">
-        <img id="render" src="/render.png" alt="{image_alt}" />
-      </div>
-    </section>
-    <aside>
-      <div class="panel-title">
-        <div>
-          <p class="eyebrow">Controls</p>
-          <h2>Color combinations</h2>
-        </div>
-        <button class="secondary" type="button" id="shuffle">Shuffle</button>
-      </div>
-
-      <div id="areas"></div>
-
-      <label class="check">
-        <input type="checkbox" id="masks" />
-        Show {mask_status}
-      </label>
-
-      <p class="eyebrow" style="margin-top: 16px;">Presets</p>
-      <div class="preset-grid" id="presets"></div>
-      <div class="saved-list" id="saved-combinations"></div>
-
-      <div class="save-actions">
-        <button type="button" id="save-combination">Save to Presets</button>
-        <button class="secondary" type="button" id="compare-original">Hold to Compare Original</button>
-      </div>
-
-      <div class="buttons">
-        <a class="button" id="download" href="/download.png" download="table-color-simulation.png">Download PNG</a>
-      </div>
-
-      <div class="hex-list" id="hexes"></div>
-    </aside>
-  </main>
-  <script>
-    const palette = {palette_json};
-    const presets = {presets_json};
-    const originalAreaColors = {original_area_colors_json};
-    const labels = {area_labels_json};
-    const defaultOpacities = {default_opacities_json};
-    const areaKeys = Object.keys(labels);
-    const state = {{
-      a: originalAreaColors.a,
-      b: originalAreaColors.b,
-      c: originalAreaColors.c,
-      oa: 0,
-      ob: 0,
-      oc: 0,
-      masks: 0
-    }};
-    const areaRoot = document.getElementById('areas');
-    const hexRoot = document.getElementById('hexes');
-    const img = document.getElementById('render');
-    const download = document.getElementById('download');
-    const savedRoot = document.getElementById('saved-combinations');
-    const storageKey = 'table-color-simulator-combinations-v1';
-    let savedCombinations = loadSavedCombinations();
-
-    function syncOpacityControls(key) {{
-      const range = document.getElementById(`${{key}}-opacity`);
-      const number = document.getElementById(`${{key}}-opacity-number`);
-      const label = document.getElementById(`${{key}}-opacity-text`);
-      if (range) range.value = state['o' + key];
-      if (number) number.value = state['o' + key];
-      if (label) label.textContent = `${{state['o' + key]}}%`;
-    }}
-
-    function activateColor(key) {{
-      if (state['o' + key] > 0) return;
-      state['o' + key] = defaultOpacities[key] ?? 45;
-      syncOpacityControls(key);
-    }}
-
-    function restoreOriginalAreaColor(key) {{
-      state[key] = originalAreaColors[key];
-      state['o' + key] = 0;
-      syncOpacityControls(key);
-    }}
-
-    function normalizeColorCode(value) {{
-      const digits = value.trim().replace(/^#/, '');
-      return /^[0-9a-f]{{6}}$/i.test(digits) ? `#${{digits.toLowerCase()}}` : null;
-    }}
-
-    function loadSavedCombinations() {{
-      try {{
-        const parsed = JSON.parse(localStorage.getItem(storageKey) || '[]');
-        if (!Array.isArray(parsed)) return [];
-        return parsed.filter((item) =>
-          item && areaKeys.every((key) => normalizeColorCode(item[key])) &&
-          areaKeys.every((key) => Number.isFinite(Number(item['o' + key])))
-        ).slice(0, 12);
-      }} catch (_) {{
-        return [];
-      }}
-    }}
-
-    function persistSavedCombinations() {{
-      try {{
-        localStorage.setItem(storageKey, JSON.stringify(savedCombinations));
-      }} catch (_) {{
-        // The in-memory list still works when browser storage is unavailable.
-      }}
-    }}
-
-    function currentCombination() {{
-      return {{
-        id: Date.now(),
-        a: state.a,
-        b: state.b,
-        c: state.c,
-        oa: state.oa,
-        ob: state.ob,
-        oc: state.oc,
-      }};
-    }}
-
-    function combinationSignature(item) {{
-      return ['a', 'b', 'c', 'oa', 'ob', 'oc'].map((key) => item[key]).join('|');
-    }}
-
-    function renderSavedCombinations() {{
-      if (!savedCombinations.length) {{
-        savedRoot.innerHTML = '<div class="saved-empty">No custom presets yet.</div>';
-        return;
-      }}
-      savedRoot.innerHTML = savedCombinations.map((item, index) => `
-        <div class="saved-item">
-          <button class="saved-apply" type="button" data-saved-action="apply" data-saved-id="${{item.id}}">
-              <span class="saved-swatches" style="--swatch-count: ${{areaKeys.length}}" aria-hidden="true">
-              ${{areaKeys.map((key) => `<span class="saved-swatch" style="background:${{item[key]}}"></span>`).join('')}}
-            </span>
-            <span class="saved-copy">
-              <span class="saved-name">Preset ${{index + 1}}</span>
-              <span class="saved-values">${{areaKeys.map((key) => `${{labels[key]}} ${{item[key].toUpperCase()}} ${{item['o' + key]}}%`).join(' · ')}}</span>
-            </span>
-          </button>
-          <button class="saved-delete" type="button" data-saved-action="delete" data-saved-id="${{item.id}}">Delete</button>
-        </div>
-      `).join('');
-    }}
-
-    function colorOptions(areaKey, selected) {{
-      const known = Object.entries(palette).some(([paletteKey, [, hex]]) => {{
-        const optionHex = paletteKey === 'original' ? originalAreaColors[areaKey] : hex;
-        return optionHex.toLowerCase() === selected.toLowerCase();
-      }});
-      const custom = known ? '' : `<option value="${{selected}}" selected>Custom color</option>`;
-      return custom + Object.entries(palette).map(([paletteKey, [name, hex]]) => {{
-        const optionHex = paletteKey === 'original' ? originalAreaColors[areaKey] : hex;
-        return `<option value="${{optionHex}}" data-palette-key="${{paletteKey}}" ${{optionHex.toLowerCase() === selected.toLowerCase() ? 'selected' : ''}}>${{name}}</option>`;
-      }}
-      ).join('');
-    }}
-
-    function renderControls() {{
-      areaRoot.innerHTML = areaKeys.map((key) => `
-        <section class="area">
-          <div class="area-head">
-            <div class="area-label">
-              <span class="swatch" id="${{key}}-swatch" style="background:${{state[key]}}"></span>
-              <span>${{labels[key]}}</span>
-            </div>
-            <select id="${{key}}-select" aria-label="Color for ${{labels[key]}}">${{colorOptions(key, state[key])}}</select>
-            <input id="${{key}}-custom" type="color" value="${{state[key]}}" aria-label="Custom color for ${{labels[key]}}" />
-          </div>
-          <input id="${{key}}-code" class="color-code" type="text" value="${{state[key].toUpperCase()}}" spellcheck="false" maxlength="7" aria-label="Color code for ${{labels[key]}}" />
-          <label>
-            <span class="range-row"><span>Opacity</span><span id="${{key}}-opacity-text">${{state['o' + key]}}%</span></span>
-            <span class="opacity-control">
-              <input id="${{key}}-opacity" type="range" min="0" max="100" value="${{state['o' + key]}}" aria-label="Opacity for ${{labels[key]}}" />
-              <input id="${{key}}-opacity-number" class="opacity-number" type="number" min="0" max="100" value="${{state['o' + key]}}" aria-label="Opacity percentage for ${{labels[key]}}" />
-            </span>
-          </label>
-        </section>
-      `).join('');
-
-      for (const key of areaKeys) {{
-        document.getElementById(`${{key}}-select`).addEventListener('change', (event) => {{
-          const paletteKey = event.target.selectedOptions[0]?.dataset.paletteKey;
-          if (paletteKey === 'original') {{
-            restoreOriginalAreaColor(key);
-          }} else {{
-            state[key] = event.target.value;
-            activateColor(key);
-          }}
-          document.getElementById(`${{key}}-custom`).value = state[key];
-          document.getElementById(`${{key}}-code`).value = state[key].toUpperCase();
-          update();
-        }});
-        document.getElementById(`${{key}}-custom`).addEventListener('input', (event) => {{
-          state[key] = event.target.value;
-          if (state[key].toLowerCase() === originalAreaColors[key].toLowerCase()) {{
-            restoreOriginalAreaColor(key);
-          }} else {{
-            activateColor(key);
-          }}
-          document.getElementById(`${{key}}-code`).value = state[key].toUpperCase();
-          update();
-        }});
-        document.getElementById(`${{key}}-code`).addEventListener('input', (event) => {{
-          const code = normalizeColorCode(event.target.value);
-          event.target.classList.toggle('invalid', !code && event.target.value.length > 0);
-          if (!code) return;
-          state[key] = code;
-          if (state[key].toLowerCase() === originalAreaColors[key].toLowerCase()) {{
-            restoreOriginalAreaColor(key);
-          }} else {{
-            activateColor(key);
-          }}
-          event.target.value = state[key].toUpperCase();
-          document.getElementById(`${{key}}-custom`).value = state[key];
-          update();
-        }});
-        const setOpacity = (value) => {{
-          state['o' + key] = Math.max(0, Math.min(100, Number(value) || 0));
-          syncOpacityControls(key);
-          update();
-        }};
-        document.getElementById(`${{key}}-opacity`).addEventListener('input', (event) => {{
-          setOpacity(event.target.value);
-        }});
-        document.getElementById(`${{key}}-opacity-number`).addEventListener('input', (event) => {{
-          setOpacity(event.target.value);
-        }});
-      }}
-    }}
-
-    function query() {{
-      const params = new URLSearchParams(state);
-      params.set('_', String(Date.now()));
-      return params.toString();
-    }}
-
-    function update() {{
-      for (const key of areaKeys) {{
-        const swatch = document.getElementById(`${{key}}-swatch`);
-        if (swatch) swatch.style.background = state[key];
-      }}
-      img.src = `/render.png?${{query()}}`;
-      download.href = `/download.png?${{query()}}`;
-      hexRoot.innerHTML = areaKeys.map((key) => `
-        <div class="hex-line">
-          <strong>${{labels[key]}}</strong>
-          <span>${{state[key].toUpperCase()}} · ${{state['o' + key]}}%</span>
-        </div>
-      `).join('');
-    }}
-
-    document.getElementById('masks').addEventListener('change', (event) => {{
-      state.masks = event.target.checked ? 1 : 0;
-      update();
-    }});
-    document.getElementById('shuffle').addEventListener('click', () => {{
-      const colors = Object.entries(palette)
-        .filter(([paletteKey]) => paletteKey !== 'original')
-        .map(([, [, hex]]) => hex);
-      for (const key of areaKeys) {{
-        state[key] = colors[Math.floor(Math.random() * colors.length)];
-        state['o' + key] = defaultOpacities[key] ?? 45;
-      }}
-      renderControls();
-      update();
-    }});
-    document.getElementById('save-combination').addEventListener('click', (event) => {{
-      const combination = currentCombination();
-      const signature = combinationSignature(combination);
-      savedCombinations = [
-        combination,
-        ...savedCombinations.filter((item) => combinationSignature(item) !== signature),
-      ].slice(0, 12);
-      persistSavedCombinations();
-      renderSavedCombinations();
-      const button = event.currentTarget;
-      button.textContent = 'Saved to Presets';
-      setTimeout(() => {{ button.textContent = 'Save to Presets'; }}, 900);
-    }});
-    savedRoot.addEventListener('click', (event) => {{
-      const button = event.target.closest('[data-saved-action]');
-      if (!button) return;
-      const id = button.dataset.savedId;
-      const item = savedCombinations.find((saved) => String(saved.id) === id);
-      if (!item) return;
-      if (button.dataset.savedAction === 'delete') {{
-        savedCombinations = savedCombinations.filter((saved) => String(saved.id) !== id);
-        persistSavedCombinations();
-        renderSavedCombinations();
-        return;
-      }}
-      Object.assign(state, {{
-        a: item.a,
-        b: item.b,
-        c: item.c,
-        oa: Math.max(0, Math.min(100, Number(item.oa ?? 0))),
-        ob: Math.max(0, Math.min(100, Number(item.ob ?? 0))),
-        oc: Math.max(0, Math.min(100, Number(item.oc ?? 0))),
-        masks: 0,
-      }});
-      document.getElementById('masks').checked = false;
-      renderControls();
-      update();
-    }});
-
-    const compareButton = document.getElementById('compare-original');
-    let comparingOriginal = false;
-    function showOriginal() {{
-      if (comparingOriginal) return;
-      comparingOriginal = true;
-      img.src = `/original.jpg?_=${{Date.now()}}`;
-    }}
-    function restoreCurrent() {{
-      if (!comparingOriginal) return;
-      comparingOriginal = false;
-      update();
-    }}
-    compareButton.addEventListener('pointerdown', (event) => {{
-      event.preventDefault();
-      showOriginal();
-    }});
-    compareButton.addEventListener('pointerup', restoreCurrent);
-    compareButton.addEventListener('pointerleave', restoreCurrent);
-    compareButton.addEventListener('pointercancel', restoreCurrent);
-    compareButton.addEventListener('keydown', (event) => {{
-      if (event.key === ' ' || event.key === 'Enter') showOriginal();
-    }});
-    compareButton.addEventListener('keyup', (event) => {{
-      if (event.key === ' ' || event.key === 'Enter') restoreCurrent();
-    }});
-    const presetRoot = document.getElementById('presets');
-    presetRoot.innerHTML = Object.entries(presets).map(([key, preset]) =>
-      `<button class="secondary" type="button" data-preset="${{key}}">${{preset.name}}</button>`
-    ).join('');
-    presetRoot.addEventListener('click', (event) => {{
-      const button = event.target.closest('[data-preset]');
-      if (!button) return;
-      Object.assign(state, presets[button.dataset.preset]);
-      renderControls();
-      update();
-    }});
-
-    renderControls();
-    renderSavedCombinations();
-    update();
-  </script>
-</body>
-</html>""".encode("utf-8")
-
-
-class AppHandler(BaseHTTPRequestHandler):
-    renderer: ColorRenderer
-
-    def do_HEAD(self) -> None:
-        parsed = urlparse(self.path)
-        if parsed.path in {"/", "/index.html"}:
-            self.send_head_headers(len(html_page(self.renderer)), "text/html; charset=utf-8")
-            return
-        if parsed.path in {"/render.png", "/download.png"}:
-            self.send_head_headers(0, "image/png")
-            return
-        if parsed.path == "/original.jpg":
-            self.send_head_headers(ORIGINAL_PATH.stat().st_size, "image/jpeg")
-            return
-        self.send_error(HTTPStatus.NOT_FOUND, "Not found")
-
-    def do_GET(self) -> None:
-        parsed = urlparse(self.path)
-        params = parse_qs(parsed.query)
-        if parsed.path in {"/", "/index.html"}:
-            self.send_bytes(html_page(self.renderer), "text/html; charset=utf-8")
-            return
-        if parsed.path in {"/render.png", "/download.png"}:
-            image = self.renderer.render(params)
-            buffer = io.BytesIO()
-            image.save(buffer, format="PNG")
-            headers = {}
-            if parsed.path == "/download.png":
-                headers["Content-Disposition"] = 'attachment; filename="table-color-simulation.png"'
-            self.send_bytes(buffer.getvalue(), "image/png", headers=headers)
-            return
-        if parsed.path == "/original.jpg":
-            self.send_file(ORIGINAL_PATH)
-            return
-        self.send_error(HTTPStatus.NOT_FOUND, "Not found")
-
-    def log_message(self, format: str, *args: object) -> None:
-        return
-
-    def send_file(self, path: Path) -> None:
-        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-        self.send_bytes(path.read_bytes(), content_type)
-
-    def send_bytes(self, body: bytes, content_type: str, headers: dict[str, str] | None = None) -> None:
-        self.send_head_headers(len(body), content_type, headers)
-        try:
-            self.wfile.write(body)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-
-    def send_head_headers(
-        self, content_length: int, content_type: str, headers: dict[str, str] | None = None
-    ) -> None:
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(content_length))
-        self.send_header("Cache-Control", "no-store")
-        for key, value in (headers or {}).items():
-            self.send_header(key, value)
-        self.end_headers()
-
-
 def export_sample(renderer: ColorRenderer, output: Path) -> None:
     params = {
         "a": ["#bfe39b"],
@@ -1438,8 +652,265 @@ def export_sample(renderer: ColorRenderer, output: Path) -> None:
     image.save(output)
 
 
+def image_to_download(image: Image.Image) -> str:
+    file = tempfile.NamedTemporaryFile(prefix="table-color-", suffix=".png", delete=False)
+    file.close()
+    image.save(file.name, format="PNG")
+    return file.name
+
+
+def params_from_values(
+    renderer: ColorRenderer,
+    colors: dict[str, str],
+    opacities: dict[str, int | float],
+    show_mask: bool,
+) -> dict[str, list[str]]:
+    params = {
+        "a": [renderer.original_area_colors["a"]],
+        "b": [renderer.original_area_colors["b"]],
+        "c": [renderer.original_area_colors["c"]],
+        "oa": ["0"],
+        "ob": ["0"],
+        "oc": ["0"],
+        "masks": ["1" if show_mask else "0"],
+    }
+    for key in renderer.editable_keys:
+        params[key] = [clean_hex(str(colors.get(key, "")), renderer.original_area_colors[key])]
+        params["o" + key] = [str(round(float(opacities.get(key, 0))))]
+    return params
+
+
+def summarize_combination(renderer: ColorRenderer, colors: dict[str, str], opacities: dict[str, int | float]) -> str:
+    lines = ["### Current Colors"]
+    for key in renderer.editable_keys:
+        label = renderer.area_labels[key]
+        color = clean_hex(str(colors.get(key, "")), renderer.original_area_colors[key]).upper()
+        opacity = round(float(opacities.get(key, 0)))
+        lines.append(f"- **{label}**: `{color}` · `{opacity}%`")
+    return "\n".join(lines)
+
+
+def render_gradio_image(
+    renderer: ColorRenderer,
+    colors: dict[str, str],
+    opacities: dict[str, int | float],
+    show_mask: bool,
+) -> tuple[Image.Image, str, str]:
+    image = renderer.render(params_from_values(renderer, colors, opacities, show_mask))
+    return image, summarize_combination(renderer, colors, opacities), image_to_download(image)
+
+
+def empty_combo(renderer: ColorRenderer) -> dict[str, object]:
+    combo: dict[str, object] = {}
+    for key in AREA_KEYS:
+        combo[key] = renderer.original_area_colors[key]
+        combo["o" + key] = 0
+    return combo
+
+
+def values_to_combo(renderer: ColorRenderer, values: tuple[object, ...]) -> dict[str, object]:
+    combo = empty_combo(renderer)
+    colors = values[: len(renderer.editable_keys)]
+    opacities = values[len(renderer.editable_keys) : len(renderer.editable_keys) * 2]
+    for key, color, opacity in zip(renderer.editable_keys, colors, opacities):
+        combo[key] = clean_hex(str(color), renderer.original_area_colors[key])
+        combo["o" + key] = max(0, min(100, round(float(opacity or 0))))
+    return combo
+
+
+def combo_to_values(renderer: ColorRenderer, combo: dict[str, object]) -> list[object]:
+    colors = [str(combo.get(key, renderer.original_area_colors[key])) for key in renderer.editable_keys]
+    opacities = [int(combo.get("o" + key, 0) or 0) for key in renderer.editable_keys]
+    return colors + opacities
+
+
+def combo_to_render_inputs(renderer: ColorRenderer, combo: dict[str, object]) -> tuple[dict[str, str], dict[str, int]]:
+    colors = {
+        key: clean_hex(str(combo.get(key, renderer.original_area_colors[key])), renderer.original_area_colors[key])
+        for key in renderer.editable_keys
+    }
+    opacities = {
+        key: max(0, min(100, round(float(combo.get("o" + key, 0) or 0))))
+        for key in renderer.editable_keys
+    }
+    return colors, opacities
+
+
+def preset_label(renderer: ColorRenderer, combo: dict[str, object], index: int) -> str:
+    parts = []
+    for key in renderer.editable_keys:
+        color = clean_hex(str(combo.get(key, renderer.original_area_colors[key])), renderer.original_area_colors[key])
+        opacity = int(combo.get("o" + key, 0) or 0)
+        parts.append(f"{renderer.area_labels[key]} {color.upper()} {opacity}%")
+    return f"Preset {index + 1}: " + " | ".join(parts)
+
+
+def saved_choices(renderer: ColorRenderer, saved: list[dict[str, object]]) -> list[str]:
+    return [preset_label(renderer, combo, index) for index, combo in enumerate(saved)]
+
+
+def combo_signature(renderer: ColorRenderer, combo: dict[str, object]) -> str:
+    parts = []
+    for key in renderer.editable_keys:
+        parts.append(str(combo.get(key, "")).lower())
+        parts.append(str(int(combo.get("o" + key, 0) or 0)))
+    return "|".join(parts)
+
+
+def load_saved_presets(renderer: ColorRenderer) -> list[dict[str, object]]:
+    try:
+        raw = json.loads(SAVED_PRESETS_PATH.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    saved = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        combo = empty_combo(renderer)
+        valid = True
+        for key in renderer.editable_keys:
+            color = clean_hex(str(item.get(key, "")), renderer.original_area_colors[key])
+            if not color:
+                valid = False
+                break
+            combo[key] = color
+            combo["o" + key] = max(0, min(100, round(float(item.get("o" + key, 0) or 0))))
+        if valid:
+            saved.append(combo)
+    return saved[:12]
+
+
+def persist_saved_presets(saved: list[dict[str, object]]) -> None:
+    SAVED_PRESETS_PATH.write_text(json.dumps(saved[:12], indent=2) + "\n")
+
+
+def build_gradio_app(renderer: ColorRenderer) -> gr.Blocks:
+    title = "Table Color Simulator"
+    mode_text = "Background only" if renderer.mode == "background" else "A / B / C only"
+    original_combo = empty_combo(renderer)
+    saved_initial = load_saved_presets(renderer)
+
+    with gr.Blocks(title=title) as app:
+        gr.Markdown(f"# {title}\n{mode_text} · Bet type colors protected")
+        saved_state = gr.State(saved_initial)
+
+        with gr.Row():
+            with gr.Column(scale=5):
+                preview = gr.Image(
+                    label="Preview",
+                    value=renderer.base,
+                    type="pil",
+                    height=620,
+                    elem_id="preview",
+                )
+                download = gr.File(label="Download PNG", value=image_to_download(renderer.base))
+            with gr.Column(scale=2):
+                color_components = []
+                opacity_components = []
+                for key in renderer.editable_keys:
+                    label = renderer.area_labels[key]
+                    color = gr.ColorPicker(label=f"{label} color", value=renderer.original_area_colors[key])
+                    opacity = gr.Slider(
+                        label=f"{label} opacity",
+                        minimum=0,
+                        maximum=100,
+                        step=1,
+                        value=0,
+                    )
+                    color_components.append(color)
+                    opacity_components.append(opacity)
+
+                show_mask = gr.Checkbox(label="Show mask overlay", value=False)
+                summary = gr.Markdown(summarize_combination(renderer, *combo_to_render_inputs(renderer, original_combo)))
+
+                with gr.Row():
+                    original_button = gr.Button("Original")
+                    shuffle_button = gr.Button("Shuffle")
+                save_button = gr.Button("Save Current")
+                save_status = gr.Markdown("")
+                saved_dropdown = gr.Dropdown(
+                    label="Saved presets",
+                    choices=saved_choices(renderer, saved_initial),
+                    value=None,
+                    interactive=True,
+                )
+                apply_saved_button = gr.Button("Apply Saved")
+
+        controls = color_components + opacity_components + [show_mask]
+        render_outputs = [preview, summary, download]
+        control_outputs = color_components + opacity_components + render_outputs
+
+        def render_callback(*values: object) -> tuple[Image.Image, str, str]:
+            colors = {
+                key: clean_hex(str(value), renderer.original_area_colors[key])
+                for key, value in zip(renderer.editable_keys, values[: len(renderer.editable_keys)])
+            }
+            opacities = {
+                key: max(0, min(100, round(float(value or 0))))
+                for key, value in zip(
+                    renderer.editable_keys,
+                    values[len(renderer.editable_keys) : len(renderer.editable_keys) * 2],
+                )
+            }
+            return render_gradio_image(renderer, colors, opacities, bool(values[-1]))
+
+        def original_callback(show_mask_value: bool) -> tuple[object, ...]:
+            colors, opacities = combo_to_render_inputs(renderer, original_combo)
+            image, text, file_path = render_gradio_image(renderer, colors, opacities, show_mask_value)
+            return (*combo_to_values(renderer, original_combo), image, text, file_path)
+
+        def shuffle_callback(show_mask_value: bool) -> tuple[object, ...]:
+            palette = [hex_value for name, hex_value in PALETTE.values() if name != "Original area color"]
+            combo = empty_combo(renderer)
+            for key in renderer.editable_keys:
+                combo[key] = random.choice(palette)
+                combo["o" + key] = renderer.default_opacities.get(key, 45)
+            colors, opacities = combo_to_render_inputs(renderer, combo)
+            image, text, file_path = render_gradio_image(renderer, colors, opacities, show_mask_value)
+            return (*combo_to_values(renderer, combo), image, text, file_path)
+
+        def save_callback(*values: object) -> tuple[list[dict[str, object]], object, str]:
+            saved = list(values[-1] or [])
+            combo = values_to_combo(renderer, values[:-1])
+            signature = combo_signature(renderer, combo)
+            saved = [combo] + [item for item in saved if combo_signature(renderer, item) != signature]
+            saved = saved[:12]
+            persist_saved_presets(saved)
+            choices = saved_choices(renderer, saved)
+            return saved, gr.update(choices=choices, value=choices[0]), "Saved."
+
+        def apply_saved_callback(selected: str | None, saved: list[dict[str, object]], show_mask_value: bool) -> tuple[object, ...]:
+            choices = saved_choices(renderer, saved or [])
+            if not selected or selected not in choices:
+                return tuple(gr.update() for _ in control_outputs)
+            combo = (saved or [])[choices.index(selected)]
+            colors, opacities = combo_to_render_inputs(renderer, combo)
+            image, text, file_path = render_gradio_image(renderer, colors, opacities, show_mask_value)
+            return (*combo_to_values(renderer, combo), image, text, file_path)
+
+        for component in controls:
+            component.change(render_callback, inputs=controls, outputs=render_outputs)
+
+        original_button.click(original_callback, inputs=[show_mask], outputs=control_outputs)
+        shuffle_button.click(shuffle_callback, inputs=[show_mask], outputs=control_outputs)
+        save_button.click(
+            save_callback,
+            inputs=color_components + opacity_components + [saved_state],
+            outputs=[saved_state, saved_dropdown, save_status],
+        )
+        apply_saved_button.click(
+            apply_saved_callback,
+            inputs=[saved_dropdown, saved_state, show_mask],
+            outputs=control_outputs,
+        )
+
+    return app
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Local PIL app for recoloring A/B/C baccarat layout areas.")
+    parser = argparse.ArgumentParser(description="Local Gradio app for recoloring table layout areas.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--export-sample", type=Path)
@@ -1454,15 +925,8 @@ def main() -> None:
         print(f"Saved {args.export_sample}")
         return
 
-    AppHandler.renderer = renderer
-    server = ThreadingHTTPServer((args.host, args.port), AppHandler)
-    print(f"Open http://{args.host}:{args.port}")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
+    app = build_gradio_app(renderer)
+    app.launch(server_name=args.host, server_port=args.port, css=GRADIO_CSS, footer_links=[])
 
 
 if __name__ == "__main__":
