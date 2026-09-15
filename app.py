@@ -590,6 +590,7 @@ class ColorRenderer:
         self.mode = "background" if is_overall_background_design(self.base) else "segmented"
         self.area_labels = BACKGROUND_AREA_LABELS if self.mode == "background" else SEGMENTED_AREA_LABELS
         self.editable_keys = tuple(self.area_labels.keys())
+        self.default_opacities = {"a": 100} if self.mode == "background" else {"a": 45, "b": 45, "c": 52}
         self.area_masks, self.original_area_colors = make_area_masks(self.base, self.mode)
         self.protection_masks = make_protection_masks(
             self.base, self.area_masks, self.mode, self.original_area_colors
@@ -607,6 +608,11 @@ class ColorRenderer:
             "b": clean_opacity(params.get("ob", ["0"])[0], 0),
             "c": clean_opacity(params.get("oc", ["0"])[0], 0),
         }
+
+        if self.mode == "background":
+            active_key = max(AREA_KEYS, key=lambda key: opacities[key])
+            colors["a"] = colors[active_key]
+            opacities["a"] = opacities[active_key]
 
         for key in ("c", "a", "b"):
             if key not in self.editable_keys:
@@ -647,6 +653,7 @@ def html_page(renderer: ColorRenderer) -> bytes:
     palette_json = json.dumps(PALETTE)
     original_area_colors_json = json.dumps(renderer.original_area_colors)
     area_labels_json = json.dumps(renderer.area_labels)
+    default_opacities_json = json.dumps(renderer.default_opacities)
     presets = {
         "original": {
             "name": "Original",
@@ -1047,6 +1054,7 @@ def html_page(renderer: ColorRenderer) -> bytes:
     const presets = {presets_json};
     const originalAreaColors = {original_area_colors_json};
     const labels = {area_labels_json};
+    const defaultOpacities = {default_opacities_json};
     const areaKeys = Object.keys(labels);
     const state = {{
       a: originalAreaColors.a,
@@ -1076,7 +1084,7 @@ def html_page(renderer: ColorRenderer) -> bytes:
 
     function activateColor(key) {{
       if (state['o' + key] > 0) return;
-      state['o' + key] = key === 'c' ? 52 : 45;
+      state['o' + key] = defaultOpacities[key] ?? 45;
       syncOpacityControls(key);
     }}
 
@@ -1170,15 +1178,15 @@ def html_page(renderer: ColorRenderer) -> bytes:
               <span class="swatch" id="${{key}}-swatch" style="background:${{state[key]}}"></span>
               <span>${{labels[key]}}</span>
             </div>
-            <select id="${{key}}-select" aria-label="Color for ${{key.toUpperCase()}} area">${{colorOptions(key, state[key])}}</select>
-            <input id="${{key}}-custom" type="color" value="${{state[key]}}" aria-label="Custom color for ${{key.toUpperCase()}} area" />
+            <select id="${{key}}-select" aria-label="Color for ${{labels[key]}}">${{colorOptions(key, state[key])}}</select>
+            <input id="${{key}}-custom" type="color" value="${{state[key]}}" aria-label="Custom color for ${{labels[key]}}" />
           </div>
-          <input id="${{key}}-code" class="color-code" type="text" value="${{state[key].toUpperCase()}}" spellcheck="false" maxlength="7" aria-label="Color code for ${{key.toUpperCase()}} area" />
+          <input id="${{key}}-code" class="color-code" type="text" value="${{state[key].toUpperCase()}}" spellcheck="false" maxlength="7" aria-label="Color code for ${{labels[key]}}" />
           <label>
             <span class="range-row"><span>Opacity</span><span id="${{key}}-opacity-text">${{state['o' + key]}}%</span></span>
             <span class="opacity-control">
-              <input id="${{key}}-opacity" type="range" min="0" max="100" value="${{state['o' + key]}}" aria-label="Opacity for ${{key.toUpperCase()}} area" />
-              <input id="${{key}}-opacity-number" class="opacity-number" type="number" min="0" max="100" value="${{state['o' + key]}}" aria-label="Opacity percentage for ${{key.toUpperCase()}} area" />
+              <input id="${{key}}-opacity" type="range" min="0" max="100" value="${{state['o' + key]}}" aria-label="Opacity for ${{labels[key]}}" />
+              <input id="${{key}}-opacity-number" class="opacity-number" type="number" min="0" max="100" value="${{state['o' + key]}}" aria-label="Opacity percentage for ${{labels[key]}}" />
             </span>
           </label>
         </section>
@@ -1250,7 +1258,7 @@ def html_page(renderer: ColorRenderer) -> bytes:
       download.href = `/download.png?${{query()}}`;
       hexRoot.innerHTML = areaKeys.map((key) => `
         <div class="hex-line">
-          <strong>${{key.toUpperCase()}}</strong>
+          <strong>${{labels[key]}}</strong>
           <span>${{state[key].toUpperCase()}} · ${{state['o' + key]}}%</span>
         </div>
       `).join('');
@@ -1266,7 +1274,7 @@ def html_page(renderer: ColorRenderer) -> bytes:
         .map(([, [, hex]]) => hex);
       for (const key of areaKeys) {{
         state[key] = colors[Math.floor(Math.random() * colors.length)];
-        state['o' + key] = key === 'c' ? 52 : 45;
+        state['o' + key] = defaultOpacities[key] ?? 45;
       }}
       renderControls();
       update();
