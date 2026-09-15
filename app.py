@@ -22,6 +22,7 @@ MANUAL_B_PATH = APP_DIR / "manual-b.png"
 BASE_W = 1280
 BASE_H = 555
 MASK_SCALE = 4
+AREA_KEYS = ("a", "b", "c")
 
 PALETTE = {
     "original": ("Original area color", "#a98f78"),
@@ -42,6 +43,9 @@ ORIGINAL_AREA_COLORS = {
     "b": "#bb9d83",
     "c": "#192551",
 }
+
+SEGMENTED_AREA_LABELS = {"a": "A areas", "b": "B areas", "c": "C areas"}
+BACKGROUND_AREA_LABELS = {"a": "Background"}
 
 PRESETS = {
     "original": {
@@ -298,6 +302,73 @@ def mask_from_condition(data: np.ndarray, feather: float = 0.7, expand: bool = T
     return mask
 
 
+def empty_mask(size: tuple[int, int]) -> Image.Image:
+    return Image.new("L", size, 0)
+
+
+def hue_distance(hue: np.ndarray, target: int) -> np.ndarray:
+    diff = np.abs(hue.astype(np.int16) - int(target))
+    return np.minimum(diff, 255 - diff)
+
+
+def rgb_to_hex(rgb: tuple[int, int, int]) -> str:
+    return "#%02x%02x%02x" % rgb
+
+
+def estimate_dominant_surface(base: Image.Image) -> tuple[str, int, int, int, float]:
+    rgb = np.asarray(base.convert("RGB"))
+    hsv = np.asarray(base.convert("HSV"))
+    h = hsv[:, :, 0]
+    s = hsv[:, :, 1]
+    v = hsv[:, :, 2]
+    non_white = ~((rgb[:, :, 0] > 245) & (rgb[:, :, 1] > 245) & (rgb[:, :, 2] > 245))
+    candidate = (s > 35) & (v > 80) & non_white
+    if not np.any(candidate):
+        return ORIGINAL_AREA_COLORS["a"], 0, 0, 0, 0.0
+
+    qh = ((h[candidate] // 4) * 4).astype(np.uint8)
+    qs = ((s[candidate] // 16) * 16).astype(np.uint8)
+    qv = ((v[candidate] // 16) * 16).astype(np.uint8)
+    bins: dict[tuple[int, int, int], int] = {}
+    for key in zip(qh.tolist(), qs.tolist(), qv.tolist()):
+        bins[key] = bins.get(key, 0) + 1
+
+    dominant_bin = max(bins, key=bins.get)
+    h0, s0, v0 = (int(value) for value in dominant_bin)
+    dominant_pixels = candidate & (hue_distance(h, h0) <= 4) & (np.abs(s.astype(np.int16) - s0) < 16)
+    if not np.any(dominant_pixels):
+        dominant_pixels = candidate & (hue_distance(h, h0) <= 8)
+
+    median_rgb = tuple(int(value) for value in np.median(rgb[dominant_pixels], axis=0).round())
+    share = bins[dominant_bin] / (base.size[0] * base.size[1])
+    return rgb_to_hex(median_rgb), h0, s0, v0, share
+
+
+def is_overall_background_design(base: Image.Image) -> bool:
+    _, _, _, _, share = estimate_dominant_surface(base)
+    return share > 0.45
+
+
+def make_overall_background_masks(base: Image.Image) -> tuple[dict[str, Image.Image], str]:
+    size = base.size
+    dominant_hex, h0, s0, v0, _ = estimate_dominant_surface(base)
+    hsv = np.asarray(base.convert("HSV"))
+    h = hsv[:, :, 0]
+    s = hsv[:, :, 1].astype(np.int16)
+    v = hsv[:, :, 2].astype(np.int16)
+
+    background_pixels = (
+        (hue_distance(h, h0) <= 9)
+        & (np.abs(s - s0) <= 55)
+        & (np.abs(v - v0) <= 75)
+    )
+    background_mask = Image.fromarray((background_pixels * 255).astype(np.uint8), "L")
+    background_mask = fill_binary_holes(background_mask)
+    background_mask = background_mask.filter(ImageFilter.MaxFilter(5))
+    background_mask = background_mask.filter(ImageFilter.GaussianBlur(max(0.18, size[0] / BASE_W * 0.06)))
+    return {"a": background_mask, "b": empty_mask(size), "c": empty_mask(size)}, dominant_hex
+
+
 def make_masks_from_manual_images(table_path: Path, b_path: Path, size: tuple[int, int]) -> dict[str, Image.Image]:
     table_overlay = Image.open(table_path).convert("RGB")
     b_overlay = Image.open(b_path).convert("RGB")
@@ -343,15 +414,21 @@ def make_masks_from_manual_images(table_path: Path, b_path: Path, size: tuple[in
     return {"a": area_a, "b": area_b, "c": area_c}
 
 
-def make_area_masks(base: Image.Image) -> dict[str, Image.Image]:
+def make_area_masks(base: Image.Image, mode: str) -> tuple[dict[str, Image.Image], dict[str, str]]:
     size = base.size
     width, height = size
 
+    if mode == "background":
+        masks, background_hex = make_overall_background_masks(base)
+        original_colors = dict(ORIGINAL_AREA_COLORS)
+        original_colors["a"] = background_hex
+        return masks, original_colors
+
     if MANUAL_TABLE_PATH.exists() and MANUAL_B_PATH.exists():
-        return make_masks_from_manual_images(MANUAL_TABLE_PATH, MANUAL_B_PATH, size)
+        return make_masks_from_manual_images(MANUAL_TABLE_PATH, MANUAL_B_PATH, size), dict(ORIGINAL_AREA_COLORS)
 
     if PPT_MASK_PATH.exists():
-        return make_masks_from_ppt_overlay(PPT_MASK_PATH, size)
+        return make_masks_from_ppt_overlay(PPT_MASK_PATH, size), dict(ORIGINAL_AREA_COLORS)
 
     table_mask = make_table_mask(size)
     raw_area_b = make_polygon_mask(
@@ -370,7 +447,7 @@ def make_area_masks(base: Image.Image) -> dict[str, Image.Image]:
 
     area_c = make_color_carpet_mask(base, table_mask)
 
-    return {"a": area_a, "b": area_b, "c": area_c}
+    return {"a": area_a, "b": area_b, "c": area_c}, dict(ORIGINAL_AREA_COLORS)
 
 
 def make_c_line_mask(base: Image.Image, area_c: Image.Image) -> Image.Image:
@@ -424,7 +501,51 @@ def make_ab_print_mask(base: Image.Image) -> Image.Image:
     return mask.filter(ImageFilter.GaussianBlur(max(0.08, width / BASE_W * 0.1)))
 
 
-def make_protection_masks(base: Image.Image, area_masks: dict[str, Image.Image]) -> dict[str, Image.Image]:
+def make_background_detail_mask(base: Image.Image, background_mask: Image.Image, background_hex: str) -> Image.Image:
+    rgb = np.asarray(base.convert("RGB"))
+    hsv = np.asarray(base.convert("HSV"))
+    target = tuple(int(background_hex[index : index + 2], 16) for index in (1, 3, 5))
+    target_img = Image.new("RGB", base.size, background_hex)
+    target_hsv = np.asarray(target_img.convert("HSV"))
+    h0 = int(target_hsv[0, 0, 0])
+    s0 = int(target_hsv[0, 0, 1])
+    v0 = int(target_hsv[0, 0, 2])
+
+    color_distance = np.sqrt(
+        ((rgb[:, :, 0].astype(np.int32) - target[0]) ** 2)
+        + ((rgb[:, :, 1].astype(np.int32) - target[1]) ** 2)
+        + ((rgb[:, :, 2].astype(np.int32) - target[2]) ** 2)
+    )
+    h = hsv[:, :, 0]
+    s = hsv[:, :, 1].astype(np.int16)
+    v = hsv[:, :, 2].astype(np.int16)
+    differs_from_background = (
+        (color_distance > 28)
+        | (hue_distance(h, h0) > 7)
+        | (np.abs(s - s0) > 35)
+        | (np.abs(v - v0) > 42)
+    )
+    detail = differs_from_background & (np.asarray(background_mask) > 8)
+    detail_mask = Image.fromarray((detail * 255).astype(np.uint8), "L")
+    detail_mask = detail_mask.filter(ImageFilter.MaxFilter(3))
+    return detail_mask.filter(ImageFilter.GaussianBlur(max(0.12, base.size[0] / BASE_W * 0.08)))
+
+
+def make_protection_masks(
+    base: Image.Image,
+    area_masks: dict[str, Image.Image],
+    mode: str,
+    original_area_colors: dict[str, str],
+) -> dict[str, Image.Image]:
+    if mode == "background":
+        return {
+            "a": ImageChops.multiply(
+                area_masks["a"], make_background_detail_mask(base, area_masks["a"], original_area_colors["a"])
+            ),
+            "b": empty_mask(base.size),
+            "c": empty_mask(base.size),
+        }
+
     ab_detail_mask = make_ab_print_mask(base)
     # The original table perimeter is dark too, but it is not betting artwork.
     # Do not paste that contour back over the A/C seam after recolouring.
@@ -466,8 +587,13 @@ def clean_opacity(value: str, fallback: int) -> float:
 class ColorRenderer:
     def __init__(self, image_path: Path):
         self.base = Image.open(image_path).convert("RGB")
-        self.area_masks = make_area_masks(self.base)
-        self.protection_masks = make_protection_masks(self.base, self.area_masks)
+        self.mode = "background" if is_overall_background_design(self.base) else "segmented"
+        self.area_labels = BACKGROUND_AREA_LABELS if self.mode == "background" else SEGMENTED_AREA_LABELS
+        self.editable_keys = tuple(self.area_labels.keys())
+        self.area_masks, self.original_area_colors = make_area_masks(self.base, self.mode)
+        self.protection_masks = make_protection_masks(
+            self.base, self.area_masks, self.mode, self.original_area_colors
+        )
 
     def render(self, params: dict[str, list[str]]) -> Image.Image:
         image = self.base.copy()
@@ -483,6 +609,8 @@ class ColorRenderer:
         }
 
         for key in ("c", "a", "b"):
+            if key not in self.editable_keys:
+                continue
             color_layer = Image.new("RGB", image.size, colors[key])
             blended = Image.blend(image, color_layer, opacities[key])
             image.paste(blended, mask=self.area_masks[key])
@@ -491,9 +619,12 @@ class ColorRenderer:
         # consistent soft-white treatment instead: its original red lines
         # look muddy against light C colors, while white remains clean across
         # every palette choice.
-        ab_protected = ImageChops.lighter(self.protection_masks["a"], self.protection_masks["b"])
-        image.paste(self.base, mask=ab_protected)
-        if opacities["c"] > 0:
+        if self.mode == "background":
+            image.paste(self.base, mask=self.protection_masks["a"])
+        else:
+            ab_protected = ImageChops.lighter(self.protection_masks["a"], self.protection_masks["b"])
+            image.paste(self.base, mask=ab_protected)
+        if self.mode == "segmented" and opacities["c"] > 0:
             c_line_alpha = self.protection_masks["c"].point(lambda value: round(value * 0.58))
             image.paste(Image.new("RGB", image.size, "#f4f7fb"), mask=c_line_alpha)
 
@@ -512,10 +643,29 @@ class ColorRenderer:
         return Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB")
 
 
-def html_page() -> bytes:
+def html_page(renderer: ColorRenderer) -> bytes:
     palette_json = json.dumps(PALETTE)
-    presets_json = json.dumps(PRESETS)
-    original_area_colors_json = json.dumps(ORIGINAL_AREA_COLORS)
+    original_area_colors_json = json.dumps(renderer.original_area_colors)
+    area_labels_json = json.dumps(renderer.area_labels)
+    presets = {
+        "original": {
+            "name": "Original",
+            "a": renderer.original_area_colors["a"],
+            "b": renderer.original_area_colors["b"],
+            "c": renderer.original_area_colors["c"],
+            "oa": 0,
+            "ob": 0,
+            "oc": 0,
+        },
+    }
+    presets_json = json.dumps(presets)
+    editable_status = "Background only" if renderer.mode == "background" else "A / B / C only"
+    mask_status = "Background mask" if renderer.mode == "background" else "A/B/C mask overlay"
+    image_alt = (
+        "Rendered baccarat layout with editable background color"
+        if renderer.mode == "background"
+        else "Rendered baccarat layout with editable A, B and C area colors"
+    )
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -784,7 +934,7 @@ def html_page() -> bytes:
     }}
     .saved-swatches {{
       display: grid;
-      grid-template-columns: repeat(3, 14px);
+      grid-template-columns: repeat(var(--swatch-count, 3), 14px);
       gap: 3px;
     }}
     .saved-swatch {{
@@ -852,12 +1002,12 @@ def html_page() -> bytes:
           <h1>Table Color Simulator</h1>
         </div>
         <div class="status">
-          <span class="pill">A / B / C only</span>
+          <span class="pill">{editable_status}</span>
           <span class="pill">Bet type colors protected</span>
         </div>
       </header>
       <div class="image-wrap">
-        <img id="render" src="/render.png" alt="Rendered baccarat layout with editable A, B and C area colors" />
+        <img id="render" src="/render.png" alt="{image_alt}" />
       </div>
     </section>
     <aside>
@@ -873,7 +1023,7 @@ def html_page() -> bytes:
 
       <label class="check">
         <input type="checkbox" id="masks" />
-        Show A/B/C mask overlay
+        Show {mask_status}
       </label>
 
       <p class="eyebrow" style="margin-top: 16px;">Presets</p>
@@ -896,6 +1046,8 @@ def html_page() -> bytes:
     const palette = {palette_json};
     const presets = {presets_json};
     const originalAreaColors = {original_area_colors_json};
+    const labels = {area_labels_json};
+    const areaKeys = Object.keys(labels);
     const state = {{
       a: originalAreaColors.a,
       b: originalAreaColors.b,
@@ -905,7 +1057,6 @@ def html_page() -> bytes:
       oc: 0,
       masks: 0
     }};
-    const labels = {{ a: 'A areas', b: 'B areas', c: 'C areas' }};
     const areaRoot = document.getElementById('areas');
     const hexRoot = document.getElementById('hexes');
     const img = document.getElementById('render');
@@ -945,8 +1096,8 @@ def html_page() -> bytes:
         const parsed = JSON.parse(localStorage.getItem(storageKey) || '[]');
         if (!Array.isArray(parsed)) return [];
         return parsed.filter((item) =>
-          item && ['a', 'b', 'c'].every((key) => normalizeColorCode(item[key])) &&
-          ['oa', 'ob', 'oc'].every((key) => Number.isFinite(Number(item[key])))
+          item && areaKeys.every((key) => normalizeColorCode(item[key])) &&
+          areaKeys.every((key) => Number.isFinite(Number(item['o' + key])))
         ).slice(0, 12);
       }} catch (_) {{
         return [];
@@ -985,14 +1136,12 @@ def html_page() -> bytes:
       savedRoot.innerHTML = savedCombinations.map((item, index) => `
         <div class="saved-item">
           <button class="saved-apply" type="button" data-saved-action="apply" data-saved-id="${{item.id}}">
-            <span class="saved-swatches" aria-hidden="true">
-              <span class="saved-swatch" style="background:${{item.a}}"></span>
-              <span class="saved-swatch" style="background:${{item.b}}"></span>
-              <span class="saved-swatch" style="background:${{item.c}}"></span>
+              <span class="saved-swatches" style="--swatch-count: ${{areaKeys.length}}" aria-hidden="true">
+              ${{areaKeys.map((key) => `<span class="saved-swatch" style="background:${{item[key]}}"></span>`).join('')}}
             </span>
             <span class="saved-copy">
               <span class="saved-name">Preset ${{index + 1}}</span>
-              <span class="saved-values">A ${{item.a.toUpperCase()}} ${{item.oa}}% · B ${{item.b.toUpperCase()}} ${{item.ob}}% · C ${{item.c.toUpperCase()}} ${{item.oc}}%</span>
+              <span class="saved-values">${{areaKeys.map((key) => `${{labels[key]}} ${{item[key].toUpperCase()}} ${{item['o' + key]}}%`).join(' · ')}}</span>
             </span>
           </button>
           <button class="saved-delete" type="button" data-saved-action="delete" data-saved-id="${{item.id}}">Delete</button>
@@ -1014,7 +1163,7 @@ def html_page() -> bytes:
     }}
 
     function renderControls() {{
-      areaRoot.innerHTML = ['a', 'b', 'c'].map((key) => `
+      areaRoot.innerHTML = areaKeys.map((key) => `
         <section class="area">
           <div class="area-head">
             <div class="area-label">
@@ -1035,7 +1184,7 @@ def html_page() -> bytes:
         </section>
       `).join('');
 
-      for (const key of ['a', 'b', 'c']) {{
+      for (const key of areaKeys) {{
         document.getElementById(`${{key}}-select`).addEventListener('change', (event) => {{
           const paletteKey = event.target.selectedOptions[0]?.dataset.paletteKey;
           if (paletteKey === 'original') {{
@@ -1093,13 +1242,13 @@ def html_page() -> bytes:
     }}
 
     function update() {{
-      for (const key of ['a', 'b', 'c']) {{
+      for (const key of areaKeys) {{
         const swatch = document.getElementById(`${{key}}-swatch`);
         if (swatch) swatch.style.background = state[key];
       }}
       img.src = `/render.png?${{query()}}`;
       download.href = `/download.png?${{query()}}`;
-      hexRoot.innerHTML = ['a', 'b', 'c'].map((key) => `
+      hexRoot.innerHTML = areaKeys.map((key) => `
         <div class="hex-line">
           <strong>${{key.toUpperCase()}}</strong>
           <span>${{state[key].toUpperCase()}} · ${{state['o' + key]}}%</span>
@@ -1115,12 +1264,10 @@ def html_page() -> bytes:
       const colors = Object.entries(palette)
         .filter(([paletteKey]) => paletteKey !== 'original')
         .map(([, [, hex]]) => hex);
-      state.a = colors[Math.floor(Math.random() * colors.length)];
-      state.b = colors[Math.floor(Math.random() * colors.length)];
-      state.c = colors[Math.floor(Math.random() * colors.length)];
-      state.oa = 45;
-      state.ob = 45;
-      state.oc = 52;
+      for (const key of areaKeys) {{
+        state[key] = colors[Math.floor(Math.random() * colors.length)];
+        state['o' + key] = key === 'c' ? 52 : 45;
+      }}
       renderControls();
       update();
     }});
@@ -1153,9 +1300,9 @@ def html_page() -> bytes:
         a: item.a,
         b: item.b,
         c: item.c,
-        oa: Math.max(0, Math.min(100, Number(item.oa))),
-        ob: Math.max(0, Math.min(100, Number(item.ob))),
-        oc: Math.max(0, Math.min(100, Number(item.oc))),
+        oa: Math.max(0, Math.min(100, Number(item.oa ?? 0))),
+        ob: Math.max(0, Math.min(100, Number(item.ob ?? 0))),
+        oc: Math.max(0, Math.min(100, Number(item.oc ?? 0))),
         masks: 0,
       }});
       document.getElementById('masks').checked = false;
@@ -1214,7 +1361,7 @@ class AppHandler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path in {"/", "/index.html"}:
-            self.send_head_headers(len(html_page()), "text/html; charset=utf-8")
+            self.send_head_headers(len(html_page(self.renderer)), "text/html; charset=utf-8")
             return
         if parsed.path in {"/render.png", "/download.png"}:
             self.send_head_headers(0, "image/png")
@@ -1228,7 +1375,7 @@ class AppHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
         if parsed.path in {"/", "/index.html"}:
-            self.send_bytes(html_page(), "text/html; charset=utf-8")
+            self.send_bytes(html_page(self.renderer), "text/html; charset=utf-8")
             return
         if parsed.path in {"/render.png", "/download.png"}:
             image = self.renderer.render(params)
