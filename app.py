@@ -16,12 +16,51 @@ from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
 APP_DIR = Path(__file__).resolve().parent
 ORIGINAL_PATH = APP_DIR / "original-hd.jpg"
+LEGACY_ARTWORK_PATH = APP_DIR / "artwork-legacy.jpg"
+ROSE_PURPLE_ARTWORK_PATH = APP_DIR / "artwork-rose-purple.jpg"
+CYAN_ARTWORK_PATH = APP_DIR / "artwork-cyan.jpg"
+REV23_ARTWORK_PATH = APP_DIR / "artwork-rev23.jpg"
 PPT_MASK_PATH = APP_DIR / "mask.png"
 MANUAL_TABLE_PATH = APP_DIR / "manual-table.png"
 MANUAL_B_PATH = APP_DIR / "manual-b.png"
+SAVED_PRESETS_PATH = APP_DIR / "saved-presets.json"
+MAX_SAVED_PRESETS = 12
 BASE_W = 1280
 BASE_H = 555
 MASK_SCALE = 4
+
+DEFAULT_ARTWORK_KEY = "rev23"
+ARTWORKS = {
+    "legacy": {
+        "name": "Original A/B/C table",
+        "path": LEGACY_ARTWORK_PATH,
+        "mode": "segmented",
+    },
+    "rose-purple": {
+        "name": "Rose purple background",
+        "path": ROSE_PURPLE_ARTWORK_PATH,
+        "mode": "background",
+    },
+    "cyan": {
+        "name": "Cyan background",
+        "path": CYAN_ARTWORK_PATH,
+        "mode": "background",
+    },
+    "rev23": {
+        "name": "Beige Rev23 multi-region",
+        "path": REV23_ARTWORK_PATH,
+        "mode": "rev23",
+    },
+}
+
+REV23_REGION_SPECS = [
+    {"key": "base", "name": "Base blue", "hex": "#90d0f0", "rgb": (144, 208, 240), "threshold": 40},
+    {"key": "cyan", "name": "Bright cyan", "hex": "#00c0f8", "rgb": (0, 192, 248), "threshold": 50},
+    {"key": "periwinkle", "name": "Periwinkle", "hex": "#e0e8f8", "rgb": (224, 232, 248), "threshold": 34},
+    {"key": "mint", "name": "Mint", "hex": "#d0f8f8", "rgb": (208, 248, 248), "threshold": 34},
+    {"key": "peach", "name": "Peach", "hex": "#f8d0b8", "rgb": (248, 208, 184), "threshold": 38},
+    {"key": "mauve", "name": "Mauve", "hex": "#d8c0c8", "rgb": (216, 192, 200), "threshold": 38},
+]
 
 PALETTE = {
     "original": ("Original area color", "#a98f78"),
@@ -298,6 +337,68 @@ def mask_from_condition(data: np.ndarray, feather: float = 0.7, expand: bool = T
     return mask
 
 
+def empty_mask(size: tuple[int, int]) -> Image.Image:
+    return Image.new("L", size, 0)
+
+
+def hue_distance(hue: np.ndarray, target: int) -> np.ndarray:
+    diff = np.abs(hue.astype(np.int16) - int(target))
+    return np.minimum(diff, 255 - diff)
+
+
+def rgb_to_hex(rgb: tuple[int, int, int]) -> str:
+    return "#%02x%02x%02x" % rgb
+
+
+def estimate_dominant_surface(base: Image.Image) -> tuple[str, int, int, int, float]:
+    rgb = np.asarray(base.convert("RGB"))
+    hsv = np.asarray(base.convert("HSV"))
+    h = hsv[:, :, 0]
+    s = hsv[:, :, 1]
+    v = hsv[:, :, 2]
+    non_white = ~((rgb[:, :, 0] > 245) & (rgb[:, :, 1] > 245) & (rgb[:, :, 2] > 245))
+    candidate = (s > 35) & (v > 80) & non_white
+    if not np.any(candidate):
+        return ORIGINAL_AREA_COLORS["a"], 0, 0, 0, 0.0
+
+    qh = ((h[candidate] // 4) * 4).astype(np.uint8)
+    qs = ((s[candidate] // 16) * 16).astype(np.uint8)
+    qv = ((v[candidate] // 16) * 16).astype(np.uint8)
+    bins: dict[tuple[int, int, int], int] = {}
+    for key in zip(qh.tolist(), qs.tolist(), qv.tolist()):
+        bins[key] = bins.get(key, 0) + 1
+
+    dominant_bin = max(bins, key=bins.get)
+    h0, s0, v0 = (int(value) for value in dominant_bin)
+    dominant_pixels = candidate & (hue_distance(h, h0) <= 4) & (np.abs(s.astype(np.int16) - s0) < 16)
+    if not np.any(dominant_pixels):
+        dominant_pixels = candidate & (hue_distance(h, h0) <= 8)
+
+    median_rgb = tuple(int(value) for value in np.median(rgb[dominant_pixels], axis=0).round())
+    share = bins[dominant_bin] / (base.size[0] * base.size[1])
+    return rgb_to_hex(median_rgb), h0, s0, v0, share
+
+
+def make_overall_background_masks(base: Image.Image) -> tuple[dict[str, Image.Image], str]:
+    size = base.size
+    dominant_hex, h0, s0, v0, _ = estimate_dominant_surface(base)
+    hsv = np.asarray(base.convert("HSV"))
+    h = hsv[:, :, 0]
+    s = hsv[:, :, 1].astype(np.int16)
+    v = hsv[:, :, 2].astype(np.int16)
+
+    background_pixels = (
+        (hue_distance(h, h0) <= 9)
+        & (np.abs(s - s0) <= 55)
+        & (np.abs(v - v0) <= 75)
+    )
+    background_mask = Image.fromarray((background_pixels * 255).astype(np.uint8), "L")
+    background_mask = fill_binary_holes(background_mask)
+    background_mask = background_mask.filter(ImageFilter.MaxFilter(5))
+    background_mask = background_mask.filter(ImageFilter.GaussianBlur(max(0.18, size[0] / BASE_W * 0.06)))
+    return {"a": background_mask}, dominant_hex
+
+
 def make_masks_from_manual_images(table_path: Path, b_path: Path, size: tuple[int, int]) -> dict[str, Image.Image]:
     table_overlay = Image.open(table_path).convert("RGB")
     b_overlay = Image.open(b_path).convert("RGB")
@@ -343,9 +444,69 @@ def make_masks_from_manual_images(table_path: Path, b_path: Path, size: tuple[in
     return {"a": area_a, "b": area_b, "c": area_c}
 
 
+def looks_like_rev23(base: Image.Image) -> bool:
+    """Detect the new Illustrator-rendered Rev23 artwork by its large blue fill."""
+    sample = base.resize((320, max(1, round(base.size[1] * 320 / base.size[0]))), Image.Resampling.BILINEAR)
+    arr = np.asarray(sample.convert("RGB"), dtype=np.int32)
+    target = np.array(REV23_REGION_SPECS[0]["rgb"], dtype=np.int32)
+    distance_squared = ((arr - target) ** 2).sum(axis=2)
+    blue_share = np.mean(distance_squared <= REV23_REGION_SPECS[0]["threshold"] ** 2)
+    return base.size[0] > 2000 and blue_share > 0.20
+
+
+def make_rev23_region_masks(base: Image.Image) -> dict[str, Image.Image]:
+    """Segment the Rev23 artwork into its large editable background fills."""
+    arr = np.asarray(base.convert("RGB"), dtype=np.int32)
+    refs = np.array([spec["rgb"] for spec in REV23_REGION_SPECS], dtype=np.int32)
+    thresholds = np.array([spec["threshold"] ** 2 for spec in REV23_REGION_SPECS], dtype=np.int32)
+
+    distances = ((arr[:, :, None, :] - refs[None, None, :, :]) ** 2).sum(axis=3)
+    nearest = distances.argmin(axis=2)
+    nearest_distance = distances.min(axis=2)
+    max_channel = arr.max(axis=2)
+    min_channel = arr.min(axis=2)
+
+    # White page/notch areas and black outside pixels should never recolor.
+    valid_background = (nearest_distance <= thresholds[nearest]) & (max_channel > 90)
+    valid_background &= ~((max_channel > 245) & (min_channel > 235))
+
+    masks: dict[str, Image.Image] = {}
+    for index, spec in enumerate(REV23_REGION_SPECS):
+        data = valid_background & (nearest == index)
+        mask = Image.fromarray((data * 255).astype(np.uint8), "L")
+        masks[spec["key"]] = mask.filter(ImageFilter.GaussianBlur(0.2))
+    return masks
+
+
+def make_rev23_detail_mask(base: Image.Image) -> Image.Image:
+    """Protect printed artwork while leaving the large fill surfaces editable."""
+    arr = np.asarray(base.convert("RGB"), dtype=np.int32)
+    refs = np.array([spec["rgb"] for spec in REV23_REGION_SPECS], dtype=np.int32)
+    thresholds = np.array([spec["threshold"] ** 2 for spec in REV23_REGION_SPECS], dtype=np.int32)
+
+    distances = ((arr[:, :, None, :] - refs[None, None, :, :]) ** 2).sum(axis=3)
+    nearest = distances.argmin(axis=2)
+    nearest_distance = distances.min(axis=2)
+    background = nearest_distance <= thresholds[nearest]
+
+    hsv = np.asarray(base.convert("HSV"))
+    h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    dark_print = (v < 150) & (s > 8)
+    saturated_print = (s > 55) & ~background
+    white_linework = (v > 210) & (s < 35) & ~background
+    detail = dark_print | saturated_print | white_linework
+
+    mask = Image.fromarray((detail * 255).astype(np.uint8), "L")
+    mask = mask.filter(ImageFilter.MaxFilter(3)).filter(ImageFilter.MinFilter(3))
+    return mask.filter(ImageFilter.GaussianBlur(0.12))
+
+
 def make_area_masks(base: Image.Image) -> dict[str, Image.Image]:
     size = base.size
     width, height = size
+
+    if looks_like_rev23(base):
+        return make_rev23_region_masks(base)
 
     if MANUAL_TABLE_PATH.exists() and MANUAL_B_PATH.exists():
         return make_masks_from_manual_images(MANUAL_TABLE_PATH, MANUAL_B_PATH, size)
@@ -424,7 +585,56 @@ def make_ab_print_mask(base: Image.Image) -> Image.Image:
     return mask.filter(ImageFilter.GaussianBlur(max(0.08, width / BASE_W * 0.1)))
 
 
-def make_protection_masks(base: Image.Image, area_masks: dict[str, Image.Image]) -> dict[str, Image.Image]:
+def make_background_detail_mask(base: Image.Image, background_mask: Image.Image, background_hex: str) -> Image.Image:
+    rgb = np.asarray(base.convert("RGB"))
+    hsv = np.asarray(base.convert("HSV"))
+    target = tuple(int(background_hex[index : index + 2], 16) for index in (1, 3, 5))
+    target_img = Image.new("RGB", base.size, background_hex)
+    target_hsv = np.asarray(target_img.convert("HSV"))
+    h0 = int(target_hsv[0, 0, 0])
+    s0 = int(target_hsv[0, 0, 1])
+    v0 = int(target_hsv[0, 0, 2])
+
+    color_distance = np.sqrt(
+        ((rgb[:, :, 0].astype(np.int32) - target[0]) ** 2)
+        + ((rgb[:, :, 1].astype(np.int32) - target[1]) ** 2)
+        + ((rgb[:, :, 2].astype(np.int32) - target[2]) ** 2)
+    )
+    h = hsv[:, :, 0]
+    s = hsv[:, :, 1].astype(np.int16)
+    v = hsv[:, :, 2].astype(np.int16)
+    differs_from_background = (
+        (color_distance > 28)
+        | (hue_distance(h, h0) > 7)
+        | (np.abs(s - s0) > 35)
+        | (np.abs(v - v0) > 42)
+    )
+    detail = differs_from_background & (np.asarray(background_mask) > 8)
+    detail_mask = Image.fromarray((detail * 255).astype(np.uint8), "L")
+    detail_mask = detail_mask.filter(ImageFilter.MaxFilter(3))
+    return detail_mask.filter(ImageFilter.GaussianBlur(max(0.12, base.size[0] / BASE_W * 0.08)))
+
+
+def make_protection_masks(
+    base: Image.Image,
+    area_masks: dict[str, Image.Image],
+    mode: str,
+    original_area_colors: dict[str, str],
+) -> dict[str, Image.Image]:
+    if mode == "background":
+        return {
+            "a": ImageChops.multiply(
+                area_masks["a"], make_background_detail_mask(base, area_masks["a"], original_area_colors["a"])
+            )
+        }
+
+    if mode == "rev23":
+        detail_mask = make_rev23_detail_mask(base)
+        return {
+            key: ImageChops.multiply(mask, detail_mask)
+            for key, mask in area_masks.items()
+        }
+
     ab_detail_mask = make_ab_print_mask(base)
     # The original table perimeter is dark too, but it is not betting artwork.
     # Do not paste that contour back over the A/C seam after recolouring.
@@ -463,39 +673,164 @@ def clean_opacity(value: str, fallback: int) -> float:
     return max(0, min(100, number)) / 100
 
 
+def clean_opacity_percent(value: object, fallback: int = 0) -> int:
+    try:
+        number = int(float(str(value)))
+    except (TypeError, ValueError):
+        number = fallback
+    return max(0, min(100, number))
+
+
+def clean_artwork_key(params: dict[str, list[str]]) -> str:
+    value = params.get("artwork", [DEFAULT_ARTWORK_KEY])[0]
+    return value if value in ARTWORKS else DEFAULT_ARTWORK_KEY
+
+
+def artwork_metadata() -> dict[str, str]:
+    return {key: spec["name"] for key, spec in ARTWORKS.items()}
+
+
+def normalize_saved_preset(item: object, area_keys: tuple[str, ...]) -> dict[str, object] | None:
+    if not isinstance(item, dict):
+        return None
+
+    normalized: dict[str, object] = {}
+    for key in area_keys:
+        color = clean_hex(str(item.get(key, "")), "")
+        if not color:
+            return None
+        normalized[key] = color
+        normalized[f"o{key}"] = clean_opacity_percent(item.get(f"o{key}", 0))
+
+    signature = "|".join(str(normalized[value]) for key in area_keys for value in (key, f"o{key}"))
+    preset_id = str(item.get("id") or signature)
+    normalized["id"] = preset_id[:80]
+    return normalized
+
+
+def load_saved_store() -> dict[str, list[dict[str, object]]]:
+    if not SAVED_PRESETS_PATH.exists():
+        return {}
+    try:
+        payload = json.loads(SAVED_PRESETS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if isinstance(payload, list):
+        return {"legacy": payload}
+    return payload if isinstance(payload, dict) else {}
+
+
+def load_saved_presets(artwork_key: str, renderer: ColorRenderer) -> list[dict[str, object]]:
+    store = load_saved_store()
+    items = store.get(artwork_key, [])
+    if not isinstance(items, list):
+        return []
+
+    presets: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for item in items:
+        normalized = normalize_saved_preset(item, renderer.area_keys)
+        if not normalized:
+            continue
+        signature = "|".join(str(normalized[value]) for key in renderer.area_keys for value in (key, f"o{key}"))
+        if signature in seen:
+            continue
+        seen.add(signature)
+        presets.append(normalized)
+        if len(presets) >= MAX_SAVED_PRESETS:
+            break
+    return presets
+
+
+def save_saved_presets(
+    artwork_key: str,
+    renderer: ColorRenderer,
+    items: object,
+) -> list[dict[str, object]]:
+    if not isinstance(items, list):
+        raise ValueError("Expected a list of presets")
+
+    presets: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for item in items:
+        normalized = normalize_saved_preset(item, renderer.area_keys)
+        if not normalized:
+            continue
+        signature = "|".join(str(normalized[value]) for key in renderer.area_keys for value in (key, f"o{key}"))
+        if signature in seen:
+            continue
+        seen.add(signature)
+        presets.append(normalized)
+        if len(presets) >= MAX_SAVED_PRESETS:
+            break
+
+    store = load_saved_store()
+    store[artwork_key] = presets
+    temp_path = SAVED_PRESETS_PATH.with_suffix(".json.tmp")
+    temp_path.write_text(json.dumps(store, indent=2), encoding="utf-8")
+    temp_path.replace(SAVED_PRESETS_PATH)
+    return presets
+
+
 class ColorRenderer:
-    def __init__(self, image_path: Path):
+    def __init__(self, image_path: Path, mode: str, name: str):
+        self.image_path = image_path
+        self.mode = mode
+        self.name = name
         self.base = Image.open(image_path).convert("RGB")
-        self.area_masks = make_area_masks(self.base)
-        self.protection_masks = make_protection_masks(self.base, self.area_masks)
+
+        if mode == "rev23":
+            self.area_masks = make_rev23_region_masks(self.base)
+            self.area_labels = {spec["key"]: spec["name"] for spec in REV23_REGION_SPECS}
+            self.original_area_colors = {spec["key"]: spec["hex"] for spec in REV23_REGION_SPECS}
+        elif mode == "background":
+            self.area_masks, background_hex = make_overall_background_masks(self.base)
+            self.area_labels = {"a": "Background"}
+            self.original_area_colors = {"a": background_hex}
+        else:
+            self.area_masks = make_area_masks(self.base)
+            self.area_labels = {"a": "A areas", "b": "B areas", "c": "C areas"}
+            self.original_area_colors = ORIGINAL_AREA_COLORS
+
+        self.area_keys = tuple(self.area_masks.keys())
+        self.protection_masks = make_protection_masks(
+            self.base, self.area_masks, self.mode, self.original_area_colors
+        )
+        self.presets = {
+            "original": {
+                "name": "Original",
+                **self.original_area_colors,
+                **{f"o{key}": 0 for key in self.area_keys},
+            }
+        }
 
     def render(self, params: dict[str, list[str]]) -> Image.Image:
         image = self.base.copy()
         colors = {
-            "a": clean_hex(params.get("a", ["#bfe39b"])[0], "#bfe39b"),
-            "b": clean_hex(params.get("b", ["#4b9b63"])[0], "#4b9b63"),
-            "c": clean_hex(params.get("c", ["#9bdcc5"])[0], "#9bdcc5"),
+            key: clean_hex(params.get(key, [self.original_area_colors[key]])[0], self.original_area_colors[key])
+            for key in self.area_keys
         }
         opacities = {
-            "a": clean_opacity(params.get("oa", ["0"])[0], 0),
-            "b": clean_opacity(params.get("ob", ["0"])[0], 0),
-            "c": clean_opacity(params.get("oc", ["0"])[0], 0),
+            key: clean_opacity(params.get(f"o{key}", ["0"])[0], 0)
+            for key in self.area_keys
         }
 
-        for key in ("c", "a", "b"):
+        for key in self.area_keys:
             color_layer = Image.new("RGB", image.size, colors[key])
             blended = Image.blend(image, color_layer, opacities[key])
             image.paste(blended, mask=self.area_masks[key])
 
-        # Keep A/B's printed artwork untouched.  The C carpet artwork gets a
-        # consistent soft-white treatment instead: its original red lines
-        # look muddy against light C colors, while white remains clean across
-        # every palette choice.
-        ab_protected = ImageChops.lighter(self.protection_masks["a"], self.protection_masks["b"])
-        image.paste(self.base, mask=ab_protected)
-        if opacities["c"] > 0:
+        if self.mode == "segmented":
+            # Keep A/B's printed artwork untouched.  The C carpet artwork gets
+            # a consistent soft-white treatment instead.
+            ab_protected = ImageChops.lighter(self.protection_masks["a"], self.protection_masks["b"])
+            image.paste(self.base, mask=ab_protected)
             c_line_alpha = self.protection_masks["c"].point(lambda value: round(value * 0.58))
-            image.paste(Image.new("RGB", image.size, "#f4f7fb"), mask=c_line_alpha)
+            if opacities["c"] > 0:
+                image.paste(Image.new("RGB", image.size, "#f4f7fb"), mask=c_line_alpha)
+        else:
+            for key in self.area_keys:
+                image.paste(self.base, mask=self.protection_masks[key])
 
         if params.get("masks", ["0"])[0] == "1":
             image = self.render_mask_overlay(image)
@@ -504,15 +839,23 @@ class ColorRenderer:
 
     def render_mask_overlay(self, image: Image.Image) -> Image.Image:
         overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
-        colors = {"a": (255, 215, 0, 72), "b": (65, 190, 100, 72), "c": (70, 150, 255, 88)}
-        for key in ("c", "a", "b"):
-            color = colors[key]
+        colors = [
+            (35, 130, 190, 92),
+            (0, 190, 230, 104),
+            (120, 135, 235, 104),
+            (70, 210, 180, 104),
+            (245, 150, 70, 104),
+            (185, 95, 140, 104),
+            (255, 215, 0, 92),
+        ]
+        for index, key in enumerate(self.area_keys):
+            color = colors[index % len(colors)]
             color_img = Image.new("RGBA", image.size, color)
             overlay.paste(color_img, mask=self.area_masks[key])
         return Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB")
 
 
-def html_page() -> bytes:
+def legacy_html_page() -> bytes:
     palette_json = json.dumps(PALETTE)
     presets_json = json.dumps(PRESETS)
     original_area_colors_json = json.dumps(ORIGINAL_AREA_COLORS)
@@ -1208,41 +1551,740 @@ def html_page() -> bytes:
 </html>""".encode("utf-8")
 
 
+def html_page(renderer: ColorRenderer, artwork_key: str) -> bytes:
+    area_keys_json = json.dumps(renderer.area_keys)
+    area_labels_json = json.dumps(renderer.area_labels)
+    original_area_colors_json = json.dumps(renderer.original_area_colors)
+    presets_json = json.dumps(renderer.presets)
+    artworks_json = json.dumps(artwork_metadata())
+    artwork_key_json = json.dumps(artwork_key)
+    template = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Table Color Simulator</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f5f7f7;
+      color: #17191a;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; background: #f5f7f7; }
+    main {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 380px;
+      gap: 16px;
+      min-height: 100vh;
+      padding: 16px;
+    }
+    .preview { min-width: 0; display: flex; flex-direction: column; gap: 12px; }
+    header {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 16px;
+      border-bottom: 1px solid rgb(23 25 26 / 12%);
+      padding-bottom: 12px;
+    }
+    h1 { margin: 0; font-size: clamp(22px, 3vw, 34px); line-height: 1.05; letter-spacing: 0; }
+    .eyebrow {
+      margin: 0 0 5px;
+      color: #4d6b70;
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+    .status { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; font-size: 12px; font-weight: 700; }
+    .pill {
+      border: 1px solid rgb(23 25 26 / 12%);
+      border-radius: 999px;
+      background: white;
+      padding: 7px 10px;
+      white-space: nowrap;
+    }
+    .image-wrap {
+      flex: 1;
+      display: grid;
+      place-items: center;
+      min-height: 420px;
+      overflow: hidden;
+      border: 1px solid rgb(0 0 0 / 14%);
+      border-radius: 8px;
+      background: white;
+      box-shadow: 0 18px 46px rgb(0 0 0 / 10%);
+    }
+    #render { display: block; width: 100%; height: auto; }
+    aside {
+      border: 1px solid rgb(23 25 26 / 12%);
+      border-radius: 8px;
+      background: white;
+      box-shadow: 0 18px 44px rgb(0 0 0 / 8%);
+      padding: 16px;
+      max-height: calc(100vh - 32px);
+      overflow: auto;
+    }
+    .panel-title { display: flex; justify-content: space-between; gap: 12px; align-items: start; }
+    h2 { margin: 2px 0 0; font-size: 18px; letter-spacing: 0; }
+    .artwork-select {
+      width: 100%;
+      height: 36px;
+      margin-top: 14px;
+      border: 1px solid rgb(23 25 26 / 18%);
+      border-radius: 8px;
+      background: white;
+      color: #17191a;
+      font: inherit;
+      font-weight: 700;
+      padding: 0 10px;
+    }
+    .area {
+      margin-top: 12px;
+      border: 1px solid rgb(23 25 26 / 12%);
+      border-radius: 8px;
+      background: #fbfcfc;
+      padding: 12px;
+    }
+    .area-head {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 48px;
+      gap: 10px;
+      align-items: center;
+    }
+    .area-label { display: flex; align-items: center; gap: 9px; min-width: 0; font-weight: 800; }
+    .area-label span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .swatch {
+      width: 30px;
+      height: 30px;
+      border-radius: 6px;
+      border: 1px solid rgb(0 0 0 / 18%);
+      box-shadow: inset 0 0 0 1px rgb(255 255 255 / 35%);
+      flex: 0 0 auto;
+    }
+    input[type="color"] {
+      width: 48px;
+      height: 34px;
+      border: 1px solid rgb(23 25 26 / 18%);
+      border-radius: 8px;
+      background: white;
+      padding: 3px;
+    }
+    .color-code, .opacity-number {
+      border: 1px solid rgb(23 25 26 / 18%);
+      border-radius: 6px;
+      background: white;
+      color: #17191a;
+      font: 700 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: 0;
+    }
+    .color-code {
+      width: 100%;
+      height: 32px;
+      margin-top: 9px;
+      padding: 0 9px;
+      text-transform: uppercase;
+    }
+    .color-code.invalid { border-color: #bd4b55; color: #a83a44; }
+    label { display: grid; gap: 7px; margin-top: 10px; color: #5d6364; font-size: 12px; font-weight: 700; }
+    .range-row { display: flex; justify-content: space-between; gap: 10px; }
+    input[type="range"] { width: 100%; accent-color: #297a86; }
+    .opacity-control { display: grid; grid-template-columns: minmax(0, 1fr) 58px; gap: 9px; align-items: center; }
+    .opacity-number { width: 58px; height: 30px; padding: 0 6px; }
+    button, a.button {
+      display: inline-flex;
+      min-height: 34px;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid rgb(23 25 26 / 14%);
+      border-radius: 8px;
+      background: #17191a;
+      color: white;
+      padding: 8px 10px;
+      font: inherit;
+      font-size: 13px;
+      font-weight: 800;
+      text-decoration: none;
+      cursor: pointer;
+    }
+    button.secondary, a.secondary { background: white; color: #17191a; }
+    .actions, .preset-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 14px; }
+    .saved-list { display: grid; gap: 7px; margin-top: 8px; }
+    .saved-empty {
+      margin-top: 8px;
+      border-top: 1px solid rgb(23 25 26 / 10%);
+      border-bottom: 1px solid rgb(23 25 26 / 10%);
+      color: #73797a;
+      padding: 10px 2px;
+      font-size: 12px;
+    }
+    .saved-item { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; align-items: stretch; }
+    .saved-apply {
+      min-width: 0;
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 9px;
+      align-items: center;
+      border-color: rgb(23 25 26 / 12%);
+      background: #fbfcfc;
+      color: #17191a;
+      padding: 8px 9px;
+      text-align: left;
+    }
+    .saved-swatches { display: grid; grid-auto-flow: column; grid-auto-columns: 10px; gap: 2px; }
+    .saved-swatch { width: 10px; height: 28px; border: 1px solid rgb(0 0 0 / 14%); border-radius: 3px; }
+    .saved-copy { min-width: 0; display: grid; gap: 2px; }
+    .saved-name { font-size: 12px; font-weight: 800; }
+    .saved-values {
+      overflow: hidden;
+      color: #686f70;
+      font: 10px ui-monospace, SFMono-Regular, Menlo, monospace;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .saved-delete { width: 58px; min-height: 46px; background: white; color: #8d3941; }
+    .check { display: flex; align-items: center; gap: 8px; margin-top: 14px; color: #424748; }
+    .check input { width: 16px; height: 16px; }
+    .hex-list { display: grid; gap: 6px; margin-top: 14px; border-radius: 8px; background: #17191a; color: white; padding: 12px; font-size: 12px; }
+    .hex-line { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    @media (max-width: 980px) {
+      main { grid-template-columns: 1fr; }
+      aside { order: -1; max-height: none; }
+      header { align-items: start; flex-direction: column; }
+      .status { justify-content: flex-start; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="preview">
+      <header>
+        <div>
+          <p class="eyebrow">Local PIL color playground</p>
+          <h1>Table Color Simulator</h1>
+        </div>
+        <div class="status">
+          <span class="pill" id="region-count"></span>
+          <span class="pill">Printed artwork protected</span>
+        </div>
+      </header>
+      <div class="image-wrap">
+        <img id="render" src="/render.png" alt="Rendered table layout with editable color regions" />
+      </div>
+    </section>
+    <aside>
+      <div class="panel-title">
+        <div>
+          <p class="eyebrow">Controls</p>
+          <h2>Color combinations</h2>
+        </div>
+        <button class="secondary" type="button" id="shuffle">Shuffle</button>
+      </div>
+
+      <label>
+        <span>Artwork</span>
+        <select class="artwork-select" id="artwork-select"></select>
+      </label>
+
+      <div id="areas"></div>
+
+      <label class="check">
+        <input type="checkbox" id="masks" />
+        Show mask overlay
+      </label>
+
+      <p class="eyebrow" style="margin-top: 16px;">Presets</p>
+      <div class="preset-grid" id="presets"></div>
+      <div class="saved-list" id="saved-combinations"></div>
+
+      <div class="actions">
+        <button type="button" id="save-combination">Save Preset</button>
+        <button class="secondary" type="button" id="compare-original">Hold Original</button>
+      </div>
+
+      <div class="actions" id="legacy-import-actions">
+        <button class="secondary" type="button" id="import-legacy-presets">Import 8765 Presets</button>
+      </div>
+
+      <div class="actions">
+        <a class="button" id="download" href="/download.png" download="table-color-simulation.png">Download PNG</a>
+      </div>
+
+      <div class="hex-list" id="hexes"></div>
+    </aside>
+  </main>
+  <script>
+    const selectedArtwork = __ARTWORK_KEY__;
+    const artworks = __ARTWORKS__;
+    const areaKeys = __AREA_KEYS__;
+    const labels = __AREA_LABELS__;
+    const originalAreaColors = __ORIGINAL_AREA_COLORS__;
+    const presets = __PRESETS__;
+    const pastelColors = ['#a9d8cf', '#b8d7f4', '#d6d2f2', '#f3d2df', '#f2d7ba', '#c8e6bd', '#f1bfc9', '#c2efe8'];
+    const state = { masks: 0 };
+    for (const key of areaKeys) {
+      state[key] = originalAreaColors[key];
+      state['o' + key] = 0;
+    }
+
+    const areaRoot = document.getElementById('areas');
+    const hexRoot = document.getElementById('hexes');
+    const img = document.getElementById('render');
+    const download = document.getElementById('download');
+    const savedRoot = document.getElementById('saved-combinations');
+    document.getElementById('region-count').textContent = `${areaKeys.length} editable regions`;
+    const storageKey = `table-color-simulator-combinations-${selectedArtwork}`;
+    const fallbackStorageKeys = selectedArtwork === 'legacy' ? ['table-color-simulator-combinations-v1'] : [];
+    let savedCombinations = loadSavedCombinations();
+
+    const artworkSelect = document.getElementById('artwork-select');
+    artworkSelect.innerHTML = Object.entries(artworks).map(([key, name]) =>
+      `<option value="${key}" ${key === selectedArtwork ? 'selected' : ''}>${name}</option>`
+    ).join('');
+    artworkSelect.addEventListener('change', (event) => {
+      window.location.href = `/?artwork=${encodeURIComponent(event.target.value)}`;
+    });
+
+    function normalizeColorCode(value) {
+      const digits = String(value || '').trim().replace(/^#/, '');
+      return /^[0-9a-f]{6}$/i.test(digits) ? `#${digits.toLowerCase()}` : null;
+    }
+
+    function clampOpacity(value) {
+      return Math.max(0, Math.min(100, Number(value) || 0));
+    }
+
+    function syncOpacityControls(key) {
+      const range = document.getElementById(`${key}-opacity`);
+      const number = document.getElementById(`${key}-opacity-number`);
+      const label = document.getElementById(`${key}-opacity-text`);
+      if (range) range.value = state['o' + key];
+      if (number) number.value = state['o' + key];
+      if (label) label.textContent = `${state['o' + key]}%`;
+    }
+
+    function activateColor(key) {
+      if (state['o' + key] > 0) return;
+      state['o' + key] = 100;
+      syncOpacityControls(key);
+    }
+
+    function normalizedCombination(item) {
+      if (!item) return null;
+      const normalized = {};
+      for (const key of areaKeys) {
+        const color = normalizeColorCode(item[key]);
+        if (!color) return null;
+        normalized[key] = color;
+        normalized['o' + key] = clampOpacity(item['o' + key]);
+      }
+      normalized.id = String(item.id || combinationSignature(normalized));
+      return normalized;
+    }
+
+    function sanitizeCombinations(items) {
+      if (!Array.isArray(items)) return [];
+      const result = [];
+      const seen = new Set();
+      for (const item of items) {
+        const normalized = normalizedCombination(item);
+        if (!normalized) continue;
+        const signature = combinationSignature(normalized);
+        if (seen.has(signature)) continue;
+        seen.add(signature);
+        result.push(normalized);
+        if (result.length >= 12) break;
+      }
+      return result;
+    }
+
+    function mergeCombinations(...groups) {
+      return sanitizeCombinations(groups.flat());
+    }
+
+    function loadSavedCombinations() {
+      try {
+        const groups = [sanitizeCombinations(JSON.parse(localStorage.getItem(storageKey) || '[]'))];
+        for (const key of fallbackStorageKeys) {
+          groups.push(sanitizeCombinations(JSON.parse(localStorage.getItem(key) || '[]')));
+        }
+        return mergeCombinations(...groups);
+      } catch (_) {
+        return [];
+      }
+    }
+
+    function persistLocalSavedCombinations() {
+      try {
+        localStorage.setItem(storageKey, JSON.stringify(savedCombinations));
+      } catch (_) {}
+    }
+
+    async function loadServerSavedCombinations() {
+      try {
+        const response = await fetch(`/saved-presets.json?artwork=${encodeURIComponent(selectedArtwork)}`, { cache: 'no-store' });
+        if (!response.ok) return;
+        const serverCombinations = sanitizeCombinations(await response.json());
+        const merged = mergeCombinations(savedCombinations, serverCombinations);
+        const serverSignature = serverCombinations.map(combinationSignature).join('\\n');
+        const mergedSignature = merged.map(combinationSignature).join('\\n');
+        savedCombinations = merged;
+        persistLocalSavedCombinations();
+        renderSavedCombinations();
+        if (mergedSignature !== serverSignature) await persistSavedCombinations();
+      } catch (_) {}
+    }
+
+    async function persistSavedCombinations() {
+      persistLocalSavedCombinations();
+      try {
+        const response = await fetch(`/saved-presets.json?artwork=${encodeURIComponent(selectedArtwork)}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(savedCombinations)
+        });
+        if (!response.ok) return;
+        savedCombinations = sanitizeCombinations(await response.json());
+        persistLocalSavedCombinations();
+        renderSavedCombinations();
+      } catch (_) {}
+    }
+
+    async function importLegacyPortPresets() {
+      if (selectedArtwork !== 'legacy') return;
+      const origins = ['http://127.0.0.1:8765', 'http://localhost:8765'];
+      let importedCount = 0;
+      for (const origin of origins) {
+        importedCount += await new Promise((resolve) => {
+        const iframe = document.createElement('iframe');
+        iframe.style.display = 'none';
+        const timeout = setTimeout(done, 1600);
+        function done(count = 0) {
+          clearTimeout(timeout);
+          window.removeEventListener('message', handleMessage);
+          iframe.remove();
+          resolve(count);
+        }
+        async function handleMessage(event) {
+          if (event.origin !== origin) return;
+          if (event.data?.source !== 'table-color-simulator-preset-export') return;
+          const imported = sanitizeCombinations(event.data.presets || []);
+          if (imported.length) {
+            const before = savedCombinations.map(combinationSignature).join('\\n');
+            savedCombinations = mergeCombinations(savedCombinations, imported);
+            const after = savedCombinations.map(combinationSignature).join('\\n');
+            if (after !== before) {
+              renderSavedCombinations();
+              await persistSavedCombinations();
+            }
+          }
+          done(imported.length);
+        }
+        window.addEventListener('message', handleMessage);
+        iframe.src = `${origin}/preset-export.html`;
+        document.body.appendChild(iframe);
+      });
+      }
+      return importedCount;
+    }
+
+    function currentCombination() {
+      const item = { id: Date.now() };
+      for (const key of areaKeys) {
+        item[key] = state[key];
+        item['o' + key] = state['o' + key];
+      }
+      return item;
+    }
+
+    function combinationSignature(item) {
+      return areaKeys.flatMap((key) => [item[key], item['o' + key]]).join('|');
+    }
+
+    function renderSavedCombinations() {
+      if (!savedCombinations.length) {
+        savedRoot.innerHTML = '<div class="saved-empty">No custom presets yet.</div>';
+        return;
+      }
+      savedRoot.innerHTML = savedCombinations.map((item, index) => {
+        const swatches = areaKeys.map((key) => `<span class="saved-swatch" style="background:${item[key]}"></span>`).join('');
+        const values = areaKeys.map((key) => `${labels[key]} ${item[key].toUpperCase()} ${item['o' + key]}%`).join(' · ');
+        return `
+          <div class="saved-item">
+            <button class="saved-apply" type="button" data-saved-action="apply" data-saved-id="${item.id}">
+              <span class="saved-swatches" aria-hidden="true">${swatches}</span>
+              <span class="saved-copy">
+                <span class="saved-name">Preset ${index + 1}</span>
+                <span class="saved-values">${values}</span>
+              </span>
+            </button>
+            <button class="saved-delete" type="button" data-saved-action="delete" data-saved-id="${item.id}">Delete</button>
+          </div>
+        `;
+      }).join('');
+    }
+
+    function renderControls() {
+      areaRoot.innerHTML = areaKeys.map((key) => `
+        <section class="area">
+          <div class="area-head">
+            <div class="area-label">
+              <span class="swatch" id="${key}-swatch" style="background:${state[key]}"></span>
+              <span>${labels[key]}</span>
+            </div>
+            <input id="${key}-custom" type="color" value="${state[key]}" aria-label="Custom color for ${labels[key]}" />
+          </div>
+          <input id="${key}-code" class="color-code" type="text" value="${state[key].toUpperCase()}" spellcheck="false" maxlength="7" aria-label="Color code for ${labels[key]}" />
+          <label>
+            <span class="range-row"><span>Opacity</span><span id="${key}-opacity-text">${state['o' + key]}%</span></span>
+            <span class="opacity-control">
+              <input id="${key}-opacity" type="range" min="0" max="100" value="${state['o' + key]}" aria-label="Opacity for ${labels[key]}" />
+              <input id="${key}-opacity-number" class="opacity-number" type="number" min="0" max="100" value="${state['o' + key]}" aria-label="Opacity percentage for ${labels[key]}" />
+            </span>
+          </label>
+        </section>
+      `).join('');
+
+      for (const key of areaKeys) {
+        document.getElementById(`${key}-custom`).addEventListener('input', (event) => {
+          state[key] = event.target.value;
+          activateColor(key);
+          document.getElementById(`${key}-code`).value = state[key].toUpperCase();
+          update();
+        });
+        document.getElementById(`${key}-code`).addEventListener('input', (event) => {
+          const code = normalizeColorCode(event.target.value);
+          event.target.classList.toggle('invalid', !code && event.target.value.length > 0);
+          if (!code) return;
+          state[key] = code;
+          activateColor(key);
+          event.target.value = state[key].toUpperCase();
+          document.getElementById(`${key}-custom`).value = state[key];
+          update();
+        });
+        const setOpacity = (value) => {
+          state['o' + key] = clampOpacity(value);
+          syncOpacityControls(key);
+          update();
+        };
+        document.getElementById(`${key}-opacity`).addEventListener('input', (event) => setOpacity(event.target.value));
+        document.getElementById(`${key}-opacity-number`).addEventListener('input', (event) => setOpacity(event.target.value));
+      }
+    }
+
+    function query() {
+      const params = new URLSearchParams();
+      params.set('artwork', selectedArtwork);
+      for (const key of areaKeys) {
+        params.set(key, state[key]);
+        params.set('o' + key, state['o' + key]);
+      }
+      params.set('masks', state.masks);
+      params.set('_', String(Date.now()));
+      return params.toString();
+    }
+
+    function update() {
+      for (const key of areaKeys) {
+        const swatch = document.getElementById(`${key}-swatch`);
+        if (swatch) swatch.style.background = state[key];
+      }
+      img.src = `/render.png?${query()}`;
+      download.href = `/download.png?${query()}`;
+      hexRoot.innerHTML = areaKeys.map((key) => `
+        <div class="hex-line">
+          <strong>${labels[key]}</strong>
+          <span>${state[key].toUpperCase()} · ${state['o' + key]}%</span>
+        </div>
+      `).join('');
+    }
+
+    document.getElementById('masks').addEventListener('change', (event) => {
+      state.masks = event.target.checked ? 1 : 0;
+      update();
+    });
+    document.getElementById('shuffle').addEventListener('click', () => {
+      for (const key of areaKeys) {
+        state[key] = pastelColors[Math.floor(Math.random() * pastelColors.length)];
+        state['o' + key] = 100;
+      }
+      renderControls();
+      update();
+    });
+    const legacyImportActions = document.getElementById('legacy-import-actions');
+    const legacyImportButton = document.getElementById('import-legacy-presets');
+    if (selectedArtwork !== 'legacy') {
+      legacyImportActions.style.display = 'none';
+    } else {
+      legacyImportButton.addEventListener('click', async () => {
+        legacyImportButton.textContent = 'Importing...';
+        const count = await importLegacyPortPresets();
+        legacyImportButton.textContent = count ? 'Imported' : 'No More Presets Found';
+        setTimeout(() => { legacyImportButton.textContent = 'Import 8765 Presets'; }, 1400);
+      });
+    }
+    document.getElementById('save-combination').addEventListener('click', async (event) => {
+      const combination = currentCombination();
+      const signature = combinationSignature(combination);
+      savedCombinations = [
+        combination,
+        ...savedCombinations.filter((item) => combinationSignature(item) !== signature),
+      ].slice(0, 12);
+      renderSavedCombinations();
+      await persistSavedCombinations();
+      const button = event.currentTarget;
+      button.textContent = 'Saved';
+      setTimeout(() => { button.textContent = 'Save Preset'; }, 900);
+    });
+    savedRoot.addEventListener('click', async (event) => {
+      const button = event.target.closest('[data-saved-action]');
+      if (!button) return;
+      const id = button.dataset.savedId;
+      const item = savedCombinations.find((saved) => String(saved.id) === id);
+      if (!item) return;
+      if (button.dataset.savedAction === 'delete') {
+        savedCombinations = savedCombinations.filter((saved) => String(saved.id) !== id);
+        renderSavedCombinations();
+        await persistSavedCombinations();
+        return;
+      }
+      for (const key of areaKeys) {
+        state[key] = item[key];
+        state['o' + key] = clampOpacity(item['o' + key]);
+      }
+      state.masks = 0;
+      document.getElementById('masks').checked = false;
+      renderControls();
+      update();
+    });
+
+    const compareButton = document.getElementById('compare-original');
+    let comparingOriginal = false;
+    function showOriginal() {
+      if (comparingOriginal) return;
+      comparingOriginal = true;
+      img.src = `/original.jpg?artwork=${encodeURIComponent(selectedArtwork)}&_=${Date.now()}`;
+    }
+    function restoreCurrent() {
+      if (!comparingOriginal) return;
+      comparingOriginal = false;
+      update();
+    }
+    compareButton.addEventListener('pointerdown', (event) => {
+      event.preventDefault();
+      showOriginal();
+    });
+    compareButton.addEventListener('pointerup', restoreCurrent);
+    compareButton.addEventListener('pointerleave', restoreCurrent);
+    compareButton.addEventListener('pointercancel', restoreCurrent);
+    compareButton.addEventListener('keydown', (event) => {
+      if (event.key === ' ' || event.key === 'Enter') showOriginal();
+    });
+    compareButton.addEventListener('keyup', (event) => {
+      if (event.key === ' ' || event.key === 'Enter') restoreCurrent();
+    });
+
+    const presetRoot = document.getElementById('presets');
+    presetRoot.innerHTML = Object.entries(presets).map(([key, preset]) =>
+      `<button class="secondary" type="button" data-preset="${key}">${preset.name}</button>`
+    ).join('');
+    presetRoot.addEventListener('click', (event) => {
+      const button = event.target.closest('[data-preset]');
+      if (!button) return;
+      const preset = presets[button.dataset.preset];
+      for (const key of areaKeys) {
+        state[key] = preset[key];
+        state['o' + key] = clampOpacity(preset['o' + key]);
+      }
+      renderControls();
+      update();
+    });
+
+    renderControls();
+    renderSavedCombinations();
+    loadServerSavedCombinations().then(importLegacyPortPresets);
+    update();
+  </script>
+</body>
+</html>"""
+    return (
+        template
+        .replace("__ARTWORK_KEY__", artwork_key_json)
+        .replace("__ARTWORKS__", artworks_json)
+        .replace("__AREA_KEYS__", area_keys_json)
+        .replace("__AREA_LABELS__", area_labels_json)
+        .replace("__ORIGINAL_AREA_COLORS__", original_area_colors_json)
+        .replace("__PRESETS__", presets_json)
+        .encode("utf-8")
+    )
+
+
 class AppHandler(BaseHTTPRequestHandler):
-    renderer: ColorRenderer
+    renderers: dict[str, ColorRenderer]
+
+    def renderer_for_params(self, params: dict[str, list[str]]) -> tuple[str, ColorRenderer]:
+        artwork_key = clean_artwork_key(params)
+        return artwork_key, self.renderers[artwork_key]
 
     def do_HEAD(self) -> None:
         parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        artwork_key, renderer = self.renderer_for_params(params)
         if parsed.path in {"/", "/index.html"}:
-            self.send_head_headers(len(html_page()), "text/html; charset=utf-8")
+            self.send_head_headers(len(html_page(renderer, artwork_key)), "text/html; charset=utf-8")
             return
         if parsed.path in {"/render.png", "/download.png"}:
             self.send_head_headers(0, "image/png")
             return
         if parsed.path == "/original.jpg":
-            self.send_head_headers(ORIGINAL_PATH.stat().st_size, "image/jpeg")
+            self.send_head_headers(renderer.image_path.stat().st_size, "image/jpeg")
+            return
+        if parsed.path == "/saved-presets.json":
+            self.send_json(load_saved_presets(artwork_key, renderer), head_only=True)
             return
         self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
+        artwork_key, renderer = self.renderer_for_params(params)
         if parsed.path in {"/", "/index.html"}:
-            self.send_bytes(html_page(), "text/html; charset=utf-8")
+            self.send_bytes(html_page(renderer, artwork_key), "text/html; charset=utf-8")
             return
         if parsed.path in {"/render.png", "/download.png"}:
-            image = self.renderer.render(params)
+            image = renderer.render(params)
             buffer = io.BytesIO()
             image.save(buffer, format="PNG")
             headers = {}
             if parsed.path == "/download.png":
-                headers["Content-Disposition"] = 'attachment; filename="table-color-simulation.png"'
+                headers["Content-Disposition"] = f'attachment; filename="table-color-simulation-{artwork_key}.png"'
             self.send_bytes(buffer.getvalue(), "image/png", headers=headers)
             return
         if parsed.path == "/original.jpg":
-            self.send_file(ORIGINAL_PATH)
+            self.send_file(renderer.image_path)
+            return
+        if parsed.path == "/saved-presets.json":
+            self.send_json(load_saved_presets(artwork_key, renderer))
             return
         self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        artwork_key, renderer = self.renderer_for_params(params)
+        if parsed.path != "/saved-presets.json":
+            self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            presets = save_saved_presets(artwork_key, renderer, payload)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, OSError):
+            self.send_error(HTTPStatus.BAD_REQUEST, "Invalid preset data")
+            return
+        self.send_json(presets)
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -1253,6 +2295,16 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def send_bytes(self, body: bytes, content_type: str, headers: dict[str, str] | None = None) -> None:
         self.send_head_headers(len(body), content_type, headers)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def send_json(self, payload: object, head_only: bool = False) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_head_headers(len(body), "application/json")
+        if head_only:
+            return
         try:
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
@@ -1271,35 +2323,39 @@ class AppHandler(BaseHTTPRequestHandler):
 
 
 def export_sample(renderer: ColorRenderer, output: Path) -> None:
-    params = {
-        "a": ["#bfe39b"],
-        "b": ["#f7bfd6"],
-        "c": ["#74bbe9"],
-        "oa": ["72"],
-        "ob": ["70"],
-        "oc": ["86"],
-    }
+    sample_colors = ["#a9d8cf", "#b8d7f4", "#d6d2f2", "#f3d2df", "#f2d7ba", "#c8e6bd"]
+    params = {}
+    for index, key in enumerate(renderer.area_keys):
+        params[key] = [sample_colors[index % len(sample_colors)]]
+        params[f"o{key}"] = ["100"]
     image = renderer.render(params)
     image.save(output)
 
 
+def build_renderers() -> dict[str, ColorRenderer]:
+    renderers: dict[str, ColorRenderer] = {}
+    for key, spec in ARTWORKS.items():
+        image_path = spec["path"]
+        if not image_path.exists():
+            raise SystemExit(f"Missing {image_path}")
+        renderers[key] = ColorRenderer(image_path, spec["mode"], spec["name"])
+    return renderers
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Local PIL app for recoloring A/B/C baccarat layout areas.")
+    parser = argparse.ArgumentParser(description="Local PIL app for recoloring table layout areas.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--export-sample", type=Path)
     args = parser.parse_args()
 
-    if not ORIGINAL_PATH.exists():
-        raise SystemExit(f"Missing {ORIGINAL_PATH}")
-
-    renderer = ColorRenderer(ORIGINAL_PATH)
+    renderers = build_renderers()
     if args.export_sample:
-        export_sample(renderer, args.export_sample)
+        export_sample(renderers[DEFAULT_ARTWORK_KEY], args.export_sample)
         print(f"Saved {args.export_sample}")
         return
 
-    AppHandler.renderer = renderer
+    AppHandler.renderers = renderers
     server = ThreadingHTTPServer((args.host, args.port), AppHandler)
     print(f"Open http://{args.host}:{args.port}")
     try:
