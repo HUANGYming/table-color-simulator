@@ -55,6 +55,7 @@ ARTWORKS = {
 
 REV23_REGION_SPECS = [
     {"key": "base", "name": "Base blue", "hex": "#90d0f0", "rgb": (144, 208, 240), "threshold": 40},
+    {"key": "left_outer", "name": "Left outer", "hex": "#90d0f0", "rgb": (144, 208, 240), "threshold": 40},
     {"key": "cyan", "name": "Bright cyan", "hex": "#00c0f8", "rgb": (0, 192, 248), "threshold": 50},
     {"key": "periwinkle", "name": "Periwinkle", "hex": "#e0e8f8", "rgb": (224, 232, 248), "threshold": 34},
     {"key": "mint", "name": "Mint", "hex": "#d0f8f8", "rgb": (208, 248, 248), "threshold": 34},
@@ -470,9 +471,109 @@ def make_rev23_region_masks(base: Image.Image) -> dict[str, Image.Image]:
     valid_background = (nearest_distance <= thresholds[nearest]) & (max_channel > 90)
     valid_background &= ~((max_channel > 245) & (min_channel > 235))
 
-    masks: dict[str, Image.Image] = {}
+    raw_masks: dict[str, np.ndarray] = {}
     for index, spec in enumerate(REV23_REGION_SPECS):
-        data = valid_background & (nearest == index)
+        raw_masks[spec["key"]] = valid_background & (nearest == index)
+
+    key_to_index = {spec["key"]: index for index, spec in enumerate(REV23_REGION_SPECS)}
+    cyan_index = key_to_index["cyan"]
+    mauve_index = key_to_index["mauve"]
+    height, width = valid_background.shape
+    half_width = width // 2
+
+    def connected_component_near(data: np.ndarray, seed_x: int, seed_y: int, radius: int = 120) -> np.ndarray:
+        seed_x = max(0, min(width - 1, seed_x))
+        seed_y = max(0, min(height - 1, seed_y))
+        if not data[seed_y, seed_x]:
+            y0 = max(0, seed_y - radius)
+            y1 = min(height, seed_y + radius + 1)
+            x0 = max(0, seed_x - radius)
+            x1 = min(width, seed_x + radius + 1)
+            nearby_y, nearby_x = np.where(data[y0:y1, x0:x1])
+            if len(nearby_x) == 0:
+                return np.zeros_like(data, dtype=bool)
+            distances = (nearby_x + x0 - seed_x) ** 2 + (nearby_y + y0 - seed_y) ** 2
+            nearest = int(distances.argmin())
+            seed_x = int(nearby_x[nearest] + x0)
+            seed_y = int(nearby_y[nearest] + y0)
+
+        component = np.zeros_like(data, dtype=bool)
+        component[seed_y, seed_x] = True
+        queue: deque[tuple[int, int]] = deque([(seed_y, seed_x)])
+        while queue:
+            y, x = queue.popleft()
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and data[ny, nx] and not component[ny, nx]:
+                    component[ny, nx] = True
+                    queue.append((ny, nx))
+        return component
+
+    def row_edge(data: np.ndarray, side: str) -> np.ndarray:
+        edge = np.full(height, -1, dtype=np.int32)
+        for y in range(height):
+            cols = np.flatnonzero(data[y])
+            if len(cols) > 0:
+                edge[y] = int(cols[0] if side == "left" else cols[-1])
+        return edge
+
+    # The far-left module shares the same fill color as Base blue.  Instead of
+    # guessing by color, construct it from four visible boundaries:
+    # top = the white arc, right = the neighboring mauve block,
+    # bottom = the table edge, left = the mirrored right edge of the far-right block.
+    left_outer = np.zeros_like(valid_background, dtype=bool)
+    fillable_surface = (max_channel > 90) & ~((max_channel > 245) & (min_channel > 235))
+    white_pixels = (arr[:, :, 0] > 240) & (arr[:, :, 1] > 240) & (arr[:, :, 2] > 240)
+    right_cyan_pixels = valid_background & (nearest == cyan_index)
+    right_cyan_pixels[:, :half_width] = False
+    left_mauve_pixels = valid_background & (nearest == mauve_index)
+    left_mauve_pixels[:, half_width:] = False
+
+    white_arc = connected_component_near(white_pixels, round(width * 0.17), round(height * 0.08))
+    right_cyan_block = keep_largest_components(right_cyan_pixels, 1)
+    left_mauve_block = keep_largest_components(left_mauve_pixels, 1)
+
+    white_left_edge = row_edge(white_arc, "left")
+    right_cyan_outer_edge = row_edge(right_cyan_block, "right")
+    left_mauve_edge = row_edge(left_mauve_block, "left")
+    left_outer_edge = np.full(height, -1, dtype=np.int32)
+    edge_rows = np.flatnonzero(right_cyan_outer_edge >= 0)
+    left_outer_edge[edge_rows] = width - 1 - right_cyan_outer_edge[edge_rows]
+    if len(edge_rows) >= 20:
+        fit_rows = edge_rows[-min(140, len(edge_rows)) :]
+        slope, intercept = np.polyfit(fit_rows, left_outer_edge[fit_rows], 1)
+        last_row = int(edge_rows[-1])
+        for y in range(last_row + 1, height):
+            predicted = int(round(slope * y + intercept))
+            if predicted <= 0 or predicted >= half_width:
+                break
+            left_outer_edge[y] = predicted
+
+    for y in range(height):
+        if left_outer_edge[y] < 0:
+            continue
+
+        left_boundary = int(left_outer_edge[y])
+        right_candidates = []
+        if white_left_edge[y] > left_boundary:
+            right_candidates.append(int(white_left_edge[y]) - 1)
+        if left_mauve_edge[y] > left_boundary:
+            right_candidates.append(int(left_mauve_edge[y]) - 1)
+        if not right_candidates:
+            continue
+
+        right_boundary = min(right_candidates)
+        if 0 <= left_boundary < right_boundary < half_width:
+            left_outer[y, left_boundary : right_boundary + 1] = fillable_surface[
+                y, left_boundary : right_boundary + 1
+            ]
+
+    left_outer = keep_largest_components(left_outer, 1)
+    raw_masks["left_outer"] = left_outer
+    raw_masks["base"] = raw_masks["base"] & ~left_outer
+
+    masks: dict[str, Image.Image] = {}
+    for spec in REV23_REGION_SPECS:
+        data = raw_masks[spec["key"]]
         mask = Image.fromarray((data * 255).astype(np.uint8), "L")
         masks[spec["key"]] = mask.filter(ImageFilter.GaussianBlur(0.2))
     return masks
